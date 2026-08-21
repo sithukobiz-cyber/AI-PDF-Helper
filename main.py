@@ -1,19 +1,14 @@
 import os
 import io
-import re
 import time
 import asyncio
 import threading
 import tempfile
-import unicodedata
-
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import requests
 import fitz
-
-from PIL import Image, ImageOps
-
+from PIL import Image
 from pypdf import PdfReader
 
 from telegram import (
@@ -45,46 +40,29 @@ OCR_URL = "https://api.ocr.space/parse/image"
 
 OCR_TIMEOUT = 120
 
-
-# ============================================================
-# OCR IMAGE SETTINGS
-# ============================================================
-
-# 413 ဖြစ်ရင် အပေါ်ကနေ အောက်ကို image size လျှော့ပြီး retry
+# OCR image settings
+# 413 ဖြစ်ရင် အဆင့်ဆင့် လျှော့ပြီး retry
 OCR_SETTINGS = [
-    (2200, 75),
-    (2000, 70),
-    (1800, 65),
-    (1600, 60),
-    (1400, 55),
-    (1200, 50),
+    (2200, 70),
+    (2000, 60),
+    (1800, 50),
+    (1600, 45),
+    (1400, 40),
 ]
 
+# 429 ဖြစ်ရင် retry
+OCR_429_RETRIES = 4
 
-# 429 rate limit ဖြစ်ရင် စောင့်မယ့်အချိန်
-RATE_LIMIT_DELAYS = [
-    10,
-    20,
-    40,
-    60,
-]
+# Request ကြား delay
+OCR_REQUEST_DELAY = 1.5
 
-
-# Page တစ်မျက်နှာကို OCR request အများဆုံး
-MAX_OCR_ATTEMPTS = len(OCR_SETTINGS)
-
-
-# ============================================================
-# USER PROCESS LOCK
-# ============================================================
-
+# User တစ်ယောက်ကို တစ်ချိန်တည်း PDF တစ်ခု
 PROCESSING_USERS = set()
-
 PROCESSING_LOCK = threading.Lock()
 
 
 # ============================================================
-# RENDER HEALTH SERVER
+# HEALTH SERVER FOR RENDER
 # ============================================================
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -144,7 +122,6 @@ def main_keyboard():
                 "📄 PDF Tools",
                 callback_data="pdf"
             ),
-
             InlineKeyboardButton(
                 "🤖 AI Tools",
                 callback_data="ai"
@@ -156,7 +133,6 @@ def main_keyboard():
                 "⭐ Premium",
                 callback_data="premium"
             ),
-
             InlineKeyboardButton(
                 "ℹ️ Help",
                 callback_data="help"
@@ -187,7 +163,8 @@ async def start(
         "🧠 AI Tools\n"
         "⭐ Premium\n\n"
 
-        "အောက်က Menu ကိုရွေးပါ 👇",
+        "PDF → Text ပြောင်းချင်ရင်\n"
+        "📄 PDF Tools ကိုနှိပ်ပါ။",
 
         reply_markup=main_keyboard()
     )
@@ -205,7 +182,6 @@ async def button_handler(
     query = update.callback_query
 
     await query.answer()
-
 
     if query.data == "pdf":
 
@@ -235,7 +211,6 @@ async def button_handler(
             reply_markup=keyboard
         )
 
-
     elif query.data == "pdf_to_text":
 
         context.user_data[
@@ -249,14 +224,14 @@ async def button_handler(
             "PDF ဖိုင်တစ်ခု ပို့ပေးပါ။\n\n"
 
             "📄 Normal PDF\n"
-            "→ Text Extract လုပ်မယ်\n\n"
+            "→ Text ကိုအရင်စစ်မယ်\n\n"
+
+            "🇲🇲 Myanmar PDF encoding "
+            "မမှန်ရင် OCR ပြန်လုပ်မယ်\n\n"
 
             "🖼️ Scanned PDF\n"
-            "→ Myanmar OCR နဲ့ ဖတ်မယ်\n\n"
-
-            "🇲🇲 Myanmar OCR Cleanup ပါဝင်ပါတယ်။"
+            "→ Myanmar OCR အသုံးပြုမယ်။"
         )
-
 
     elif query.data == "ai":
 
@@ -266,7 +241,6 @@ async def button_handler(
             "AI Features မကြာခင် ထည့်ပေးပါမယ်။"
         )
 
-
     elif query.data == "premium":
 
         await query.edit_message_text(
@@ -274,7 +248,6 @@ async def button_handler(
             "⭐ Premium\n\n"
             "Premium system မကြာခင် ထည့်ပေးပါမယ်။"
         )
-
 
     elif query.data == "help":
 
@@ -287,10 +260,10 @@ async def button_handler(
             "📄 PDF Tools\n"
             "→ PDF → Text\n\n"
 
-            "🇲🇲 Myanmar OCR\n"
-            "→ Scanned PDF များအတွက်"
+            "🇲🇲 Myanmar PDF တွေအတွက်\n"
+            "encoding စစ်ပြီး OCR fallback "
+            "အသုံးပြုပါမယ်။"
         )
-
 
     elif query.data == "back":
 
@@ -304,14 +277,131 @@ async def button_handler(
 
 
 # ============================================================
-# NORMAL PDF TEXT EXTRACTION
+# MYANMAR TEXT QUALITY CHECK
+# ============================================================
+
+def count_myanmar_chars(text):
+
+    count = 0
+
+    for ch in text:
+
+        code = ord(ch)
+
+        if (
+            0x1000 <= code <= 0x109F
+        ):
+
+            count += 1
+
+    return count
+
+
+def count_suspicious_myanmar_patterns(text):
+
+    patterns = [
+
+        "ေြ",
+        "ြေ",
+        "်ေ",
+        "ေျ",
+        "ြ်",
+        "ဴ",
+        "ဵ",
+        "၀",
+        "၁",
+        "၂",
+        "၃",
+        "၄",
+        "၅",
+        "၆",
+        "၇",
+        "၈",
+        "၉",
+
+    ]
+
+    score = 0
+
+    for pattern in patterns:
+
+        score += text.count(pattern)
+
+    return score
+
+
+def is_myanmar_text_bad(text):
+
+    if not text:
+
+        return True
+
+    stripped = text.strip()
+
+    if len(stripped) < 50:
+
+        return True
+
+    myanmar_count = count_myanmar_chars(
+        stripped
+    )
+
+    suspicious = (
+        count_suspicious_myanmar_patterns(
+            stripped
+        )
+    )
+
+    # မြန်မာစာပါဝင်ပြီး
+    # encoding ပျက်နိုင်တဲ့ pattern
+    # အများကြီးရှိရင် reject
+    if myanmar_count >= 20:
+
+        if suspicious >= 8:
+
+            print(
+                "Myanmar text quality: BAD"
+            )
+
+            print(
+                "Myanmar chars:",
+                myanmar_count
+            )
+
+            print(
+                "Suspicious:",
+                suspicious
+            )
+
+            return True
+
+    # မြန်မာစာနည်းလွန်းရင် OCR
+    if (
+        myanmar_count == 0
+        and len(stripped) > 100
+    ):
+
+        return True
+
+    print(
+        "Myanmar text quality: "
+        "ACCEPTABLE"
+    )
+
+    return False
+
+
+# ============================================================
+# NORMAL PDF EXTRACTION
 # ============================================================
 
 def extract_pdf_text(pdf_path):
 
     try:
 
-        reader = PdfReader(pdf_path)
+        reader = PdfReader(
+            pdf_path
+        )
 
         parts = []
 
@@ -337,7 +427,8 @@ def extract_pdf_text(pdf_path):
             except Exception as e:
 
                 print(
-                    f"Page {index} extraction error:",
+                    f"Page {index} "
+                    f"extract error:",
                     repr(e)
                 )
 
@@ -363,193 +454,6 @@ def extract_pdf_text(pdf_path):
 
 
 # ============================================================
-# MYANMAR TEXT CLEANUP
-# ============================================================
-
-def clean_myanmar_text(text):
-
-    if not text:
-        return ""
-
-
-    # --------------------------------------------------------
-    # Unicode normalization
-    # --------------------------------------------------------
-
-    text = unicodedata.normalize(
-        "NFC",
-        text
-    )
-
-
-    # --------------------------------------------------------
-    # Remove NULL/control characters
-    # --------------------------------------------------------
-
-    text = text.replace(
-        "\x00",
-        ""
-    )
-
-    text = re.sub(
-        r"[\x01-\x08\x0B\x0C\x0E-\x1F]",
-        "",
-        text
-    )
-
-
-    # --------------------------------------------------------
-    # Normalize line endings
-    # --------------------------------------------------------
-
-    text = text.replace(
-        "\r\n",
-        "\n"
-    )
-
-    text = text.replace(
-        "\r",
-        "\n"
-    )
-
-
-    # --------------------------------------------------------
-    # Normalize spaces
-    # --------------------------------------------------------
-
-    text = re.sub(
-        r"[ \t]+",
-        " ",
-        text
-    )
-
-
-    # --------------------------------------------------------
-    # Remove spaces at beginning/end
-    # --------------------------------------------------------
-
-    lines = []
-
-    for line in text.split("\n"):
-
-        line = line.strip()
-
-        if line:
-
-            lines.append(line)
-
-        else:
-
-            # မျက်နှာစာကြား blank line
-            # အလွန်များမသွားအောင်
-            if lines and lines[-1] != "":
-
-                lines.append("")
-
-
-    text = "\n".join(lines)
-
-
-    # --------------------------------------------------------
-    # Excessive blank lines
-    # --------------------------------------------------------
-
-    text = re.sub(
-        r"\n{4,}",
-        "\n\n\n",
-        text
-    )
-
-
-    # --------------------------------------------------------
-    # OCR မှာ မကြာခဏ ထပ်နေတဲ့ spaces
-    # --------------------------------------------------------
-
-    text = re.sub(
-        r" {2,}",
-        " ",
-        text
-    )
-
-
-    # --------------------------------------------------------
-    # Myanmar punctuation spacing cleanup
-    # --------------------------------------------------------
-
-    text = re.sub(
-        r"\s+([၊။！？])",
-        r"\1",
-        text
-    )
-
-
-    # --------------------------------------------------------
-    # English punctuation spacing
-    # --------------------------------------------------------
-
-    text = re.sub(
-        r"\s+([,.!?;:])",
-        r"\1",
-        text
-    )
-
-
-    # --------------------------------------------------------
-    # Space after Myanmar punctuation
-    # --------------------------------------------------------
-
-    text = re.sub(
-        r"([၊။])([^\s])",
-        r"\1 \2",
-        text
-    )
-
-
-    # --------------------------------------------------------
-    # Common OCR junk
-    # --------------------------------------------------------
-
-    junk_patterns = [
-        r"^[|]+$",
-        r"^[_]+$",
-        r"^[-]{5,}$",
-        r"^[~`]+$",
-    ]
-
-    cleaned_lines = []
-
-    for line in text.split("\n"):
-
-        stripped = line.strip()
-
-        is_junk = False
-
-        for pattern in junk_patterns:
-
-            if re.fullmatch(
-                pattern,
-                stripped
-            ):
-
-                is_junk = True
-                break
-
-        if not is_junk:
-
-            cleaned_lines.append(
-                line
-            )
-
-
-    text = "\n".join(
-        cleaned_lines
-    )
-
-
-    return text.strip()
-
-
-# ============================================================
 # CREATE OCR IMAGE
 # ============================================================
 
@@ -559,10 +463,6 @@ def create_ocr_image(
     quality
 ):
 
-    # --------------------------------------------------------
-    # Render page
-    # --------------------------------------------------------
-
     pix = page.get_pixmap(
         matrix=fitz.Matrix(
             2.0,
@@ -571,31 +471,14 @@ def create_ocr_image(
         alpha=False
     )
 
-
     image = Image.frombytes(
         "RGB",
-        (
+        [
             pix.width,
             pix.height
-        ),
+        ],
         pix.samples
     )
-
-
-    # --------------------------------------------------------
-    # Auto contrast
-    # --------------------------------------------------------
-
-    try:
-
-        image = ImageOps.autocontrast(
-            image
-        )
-
-    except Exception:
-
-        pass
-
 
     width, height = image.size
 
@@ -603,11 +486,6 @@ def create_ocr_image(
         width,
         height
     )
-
-
-    # --------------------------------------------------------
-    # Resize
-    # --------------------------------------------------------
 
     if largest > max_dimension:
 
@@ -619,15 +497,9 @@ def create_ocr_image(
 
         new_size = (
 
-            max(
-                1,
-                int(width * scale)
-            ),
+            int(width * scale),
 
-            max(
-                1,
-                int(height * scale)
-            )
+            int(height * scale)
         )
 
         image = image.resize(
@@ -635,24 +507,13 @@ def create_ocr_image(
             Image.Resampling.LANCZOS
         )
 
-
-    # --------------------------------------------------------
-    # JPEG
-    # --------------------------------------------------------
-
     buffer = io.BytesIO()
 
     image.save(
-
         buffer,
-
         format="JPEG",
-
         quality=quality,
-
-        optimize=True,
-
-        progressive=True
+        optimize=True
     )
 
     buffer.seek(0)
@@ -670,35 +531,28 @@ def send_ocr_request(
 
     image_buffer.seek(0)
 
-
     response = requests.post(
 
         OCR_URL,
 
         headers={
-
-            "apikey":
-                OCR_API_KEY
+            "apikey": OCR_API_KEY
         },
 
         files={
 
             "file": (
-
                 "page.jpg",
-
                 image_buffer,
-
                 "image/jpeg"
             )
         },
 
         data={
 
-            # Myanmar OCR
             "language": "mya",
 
-            "OCREngine": "2",
+            "OCREngine": "3",
 
             "isOverlayRequired":
                 "false",
@@ -709,45 +563,12 @@ def send_ocr_request(
             "scale":
                 "true",
 
-            "isTable":
-                "false",
         },
 
         timeout=OCR_TIMEOUT
     )
 
-
     return response
-
-
-# ============================================================
-# OCR ERROR MESSAGE
-# ============================================================
-
-def get_ocr_error_message(
-    result
-):
-
-    message = result.get(
-        "ErrorMessage",
-        "OCR processing error"
-    )
-
-
-    if isinstance(
-        message,
-        list
-    ):
-
-        message = " ".join(
-            str(x)
-            for x in message
-        )
-
-
-    return str(
-        message
-    )
 
 
 # ============================================================
@@ -766,14 +587,9 @@ def ocr_page(
             "OCR_API_KEY မတွေ့ပါ"
         )
 
-
     last_error = (
         "Unknown OCR error"
     )
-
-
-    rate_limit_count = 0
-
 
     for attempt, (
         max_dimension,
@@ -784,164 +600,139 @@ def ocr_page(
     ):
 
         print(
-
-            f"OCR page {page_number}: "
-
-            f"attempt {attempt}/"
-            f"{MAX_OCR_ATTEMPTS} "
-
-            f"size={max_dimension} "
-
-            f"quality={quality}"
+            f"Page {page_number}: "
+            f"OCR attempt {attempt}/"
+            f"{len(OCR_SETTINGS)}"
         )
-
 
         try:
 
             image_buffer = (
                 create_ocr_image(
-
                     page,
-
                     max_dimension,
-
                     quality
                 )
             )
-
 
             image_size = len(
                 image_buffer.getvalue()
             )
 
-
             print(
-
-                f"OCR page {page_number}: "
-
-                f"image="
+                f"Page {page_number}: "
+                f"image "
                 f"{image_size / 1024:.1f} KB"
             )
 
+            # ------------------------------------------------
+            # 429 retry
+            # ------------------------------------------------
 
-            response = (
-                send_ocr_request(
-                    image_buffer
-                )
-            )
+            for retry in range(
+                OCR_429_RETRIES
+            ):
 
-
-            status = (
-                response.status_code
-            )
-
-
-            print(
-
-                f"OCR page {page_number}: "
-
-                f"HTTP {status}"
-            )
-
-
-            # =================================================
-            # 413 PAYLOAD TOO LARGE
-            # =================================================
-
-            if status == 413:
-
-                last_error = (
-                    "HTTP 413"
+                response = (
+                    send_ocr_request(
+                        image_buffer
+                    )
                 )
 
                 print(
-
                     f"Page {page_number}: "
-
-                    "413 -> "
-                    "reducing image size"
+                    f"OCR HTTP "
+                    f"{response.status_code}"
                 )
 
-                continue
-
-
-            # =================================================
-            # 429 RATE LIMIT
-            # =================================================
-
-            if status == 429:
-
-                last_error = (
-                    "HTTP 429"
-                )
-
-                if rate_limit_count < len(
-                    RATE_LIMIT_DELAYS
+                if (
+                    response.status_code
+                    == 429
                 ):
 
-                    delay = (
-                        RATE_LIMIT_DELAYS[
-                            rate_limit_count
-                        ]
+                    wait_time = (
+                        8 * (retry + 1)
                     )
-
-                    rate_limit_count += 1
 
                     print(
-
-                        f"Page {page_number}: "
-
-                        f"OCR rate limited. "
-
-                        f"Waiting {delay}s..."
+                        f"Page "
+                        f"{page_number}: "
+                        f"HTTP 429. "
+                        f"Waiting "
+                        f"{wait_time}s..."
                     )
-
 
                     time.sleep(
-                        delay
+                        wait_time
                     )
 
-                    # Same image size ကို
-                    # retry ပြန်လုပ်
+                    image_buffer.seek(
+                        0
+                    )
+
                     continue
 
-                else:
-
-                    print(
-
-                        f"Page {page_number}: "
-
-                        "429 retry limit reached"
-                    )
-
-                    break
+                break
 
 
-            # =================================================
-            # OTHER HTTP ERROR
-            # =================================================
+            # ------------------------------------------------
+            # 413
+            # ------------------------------------------------
 
-            if status != 200:
+            if response.status_code == 413:
 
                 last_error = (
-                    f"HTTP {status}"
+                    "OCR API HTTP 413"
                 )
 
                 print(
-
-                    f"Page {page_number}: "
-
-                    f"{last_error}"
+                    f"Page "
+                    f"{page_number}: "
+                    "413 → reducing "
+                    "image size"
                 )
-
-                time.sleep(3)
 
                 continue
 
 
-            # =================================================
+            # ------------------------------------------------
+            # 429
+            # ------------------------------------------------
+
+            if response.status_code == 429:
+
+                last_error = (
+                    "OCR API HTTP 429"
+                )
+
+                print(
+                    f"Page "
+                    f"{page_number}: "
+                    "429 after retries"
+                )
+
+                # နောက် image size
+                # သို့သွား
+                continue
+
+
+            # ------------------------------------------------
+            # Other HTTP errors
+            # ------------------------------------------------
+
+            if response.status_code != 200:
+
+                last_error = (
+                    f"OCR API HTTP "
+                    f"{response.status_code}"
+                )
+
+                continue
+
+
+            # ------------------------------------------------
             # JSON
-            # =================================================
+            # ------------------------------------------------
 
             try:
 
@@ -950,48 +741,55 @@ def ocr_page(
             except Exception as e:
 
                 last_error = (
-                    "Invalid JSON response"
+                    "Invalid OCR JSON"
                 )
 
                 print(
-
-                    f"Page {page_number}: "
-
-                    "Invalid JSON:",
                     repr(e)
                 )
 
                 continue
 
 
-            # =================================================
-            # OCR API ERROR
-            # =================================================
+            # ------------------------------------------------
+            # OCR API error
+            # ------------------------------------------------
 
             if result.get(
                 "IsErroredOnProcessing"
             ):
 
-                last_error = (
-                    get_ocr_error_message(
-                        result
+                message = result.get(
+                    "ErrorMessage",
+                    "OCR processing error"
+                )
+
+                if isinstance(
+                    message,
+                    list
+                ):
+
+                    message = " ".join(
+                        str(x)
+                        for x in message
                     )
+
+                last_error = str(
+                    message
                 )
 
                 print(
-
-                    f"Page {page_number}: "
-
-                    f"OCR error: "
+                    f"Page "
+                    f"{page_number}: "
                     f"{last_error}"
                 )
 
                 continue
 
 
-            # =================================================
-            # PARSED RESULTS
-            # =================================================
+            # ------------------------------------------------
+            # Extract OCR text
+            # ------------------------------------------------
 
             parsed_results = (
                 result.get(
@@ -1000,19 +798,14 @@ def ocr_page(
                 )
             )
 
-
             text_parts = []
-
 
             for item in parsed_results:
 
-                parsed_text = (
-                    item.get(
-                        "ParsedText",
-                        ""
-                    )
+                parsed_text = item.get(
+                    "ParsedText",
+                    ""
                 )
-
 
                 if parsed_text:
 
@@ -1020,30 +813,16 @@ def ocr_page(
                         parsed_text
                     )
 
-
-            raw_text = "\n".join(
+            text = "\n".join(
                 text_parts
             ).strip()
 
-
-            # =================================================
-            # CLEANUP
-            # =================================================
-
-            text = clean_myanmar_text(
-                raw_text
-            )
-
-
             print(
-
-                f"OCR page {page_number}: "
-
-                f"raw={len(raw_text)} "
-
-                f"clean={len(text)}"
+                f"Page "
+                f"{page_number}: "
+                f"OCR text length "
+                f"{len(text)}"
             )
-
 
             if text:
 
@@ -1052,11 +831,9 @@ def ocr_page(
                     None
                 )
 
-
             last_error = (
                 "OCR returned empty text"
             )
-
 
         except requests.Timeout:
 
@@ -1065,15 +842,10 @@ def ocr_page(
             )
 
             print(
-
-                f"Page {page_number}: "
-
-                "OCR timeout"
+                f"Page "
+                f"{page_number}: "
+                "timeout"
             )
-
-
-            time.sleep(3)
-
 
         except requests.RequestException as e:
 
@@ -1082,29 +854,25 @@ def ocr_page(
             )
 
             print(
-
-                f"Page {page_number}: "
-
-                f"{last_error}"
+                repr(e)
             )
-
-
-            time.sleep(3)
-
 
         except Exception as e:
 
             last_error = str(e)
 
             print(
-
-                f"Page {page_number}: "
-
+                f"Page "
+                f"{page_number}: "
                 "unexpected error:",
-
                 repr(e)
             )
 
+        # API ကို အရမ်းမြန်မြန်
+        # မပစ်ရန်
+        time.sleep(
+            OCR_REQUEST_DELAY
+        )
 
     return (
         "",
@@ -1117,37 +885,28 @@ def ocr_page(
 # ============================================================
 
 def process_pdf_ocr(
-    pdf_path
+    pdf_path,
+    progress_callback=None
 ):
 
     pdf = fitz.open(
         pdf_path
     )
 
-
-    total_pages = len(
-        pdf
-    )
-
-
     all_pages = {}
 
     failed_pages = []
 
-
     try:
 
-        print(
-
-            f"OCR starting: "
-
-            f"{total_pages} page(s)"
+        total_pages = len(
+            pdf
         )
 
-
-        # =====================================================
-        # FIRST PASS
-        # =====================================================
+        print(
+            f"OCR starting: "
+            f"{total_pages} pages"
+        )
 
         for index in range(
             total_pages
@@ -1157,33 +916,25 @@ def process_pdf_ocr(
                 index + 1
             )
 
-
             print(
-
-                f"===================================="
-
-            )
-
-            print(
-
                 f"OCR page "
                 f"{page_number}/"
                 f"{total_pages}"
             )
 
+            if progress_callback:
+
+                progress_callback(
+                    page_number,
+                    total_pages
+                )
 
             page = pdf[index]
 
-
-            text, error = (
-                ocr_page(
-
-                    page,
-
-                    page_number
-                )
+            text, error = ocr_page(
+                page,
+                page_number
             )
-
 
             if text:
 
@@ -1193,114 +944,35 @@ def process_pdf_ocr(
 
             else:
 
-                print(
-
-                    f"OCR failed on page "
-                    f"{page_number}: "
-                    f"{error}"
-                )
-
                 failed_pages.append(
                     page_number
                 )
 
-
-        # =====================================================
-        # SECOND PASS
-        # =====================================================
-
-        if failed_pages:
-
-            print(
-
-                "===================================="
-            )
-
-            print(
-
-                "Retrying failed pages:",
-                failed_pages
-            )
-
-
-            remaining_failed = []
-
-
-            for page_number in failed_pages:
+                all_pages[
+                    page_number
+                ] = (
+                    "[OCR FAILED]"
+                )
 
                 print(
-
-                    f"Retry page "
-                    f"{page_number}"
+                    f"OCR failed "
+                    f"page {page_number}: "
+                    f"{error}"
                 )
-
-
-                page = pdf[
-                    page_number - 1
-                ]
-
-
-                # Rate-limit ကပ်နေရင်
-                # retry အတွက် ခဏစောင့်
-                time.sleep(2)
-
-
-                text, error = (
-                    ocr_page(
-
-                        page,
-
-                        page_number
-                    )
-                )
-
-
-                if text:
-
-                    all_pages[
-                        page_number
-                    ] = text
-
-                    print(
-
-                        f"Retry SUCCESS "
-                        f"page {page_number}"
-                    )
-
-                else:
-
-                    remaining_failed.append(
-                        page_number
-                    )
-
-                    print(
-
-                        f"Retry FAILED "
-                        f"page {page_number}: "
-                        f"{error}"
-                    )
-
-
-            failed_pages = (
-                remaining_failed
-            )
-
 
     finally:
 
         pdf.close()
 
 
-    # =========================================================
-    # BUILD FINAL TEXT IN PAGE ORDER
-    # =========================================================
+    # --------------------------------------------------------
+    # Build text in correct page order
+    # --------------------------------------------------------
 
     output_parts = []
 
-
-    for page_number in range(
-        1,
-        total_pages + 1
+    for page_number in sorted(
+        all_pages.keys()
     ):
 
         output_parts.append(
@@ -1309,34 +981,18 @@ def process_pdf_ocr(
             f"{page_number} ---\n"
         )
 
+        output_parts.append(
+            all_pages[
+                page_number
+            ]
+        )
 
-        if page_number in all_pages:
-
-            output_parts.append(
-                all_pages[
-                    page_number
-                ]
-            )
-
-        else:
-
-            output_parts.append(
-                "[OCR FAILED]"
-            )
+        output_parts.append("\n")
 
 
-    result = "\n".join(
+    result = "".join(
         output_parts
     ).strip()
-
-
-    # =========================================================
-    # FINAL CLEANUP
-    # =========================================================
-
-    result = clean_myanmar_text(
-        result
-    )
 
 
     print(
@@ -1344,20 +1000,10 @@ def process_pdf_ocr(
         len(result)
     )
 
-
-    if failed_pages:
-
-        print(
-            "Failed pages:",
-            failed_pages
-        )
-
-    else:
-
-        print(
-            "All OCR pages completed."
-        )
-
+    print(
+        "Failed pages:",
+        failed_pages
+    )
 
     return (
         result,
@@ -1366,34 +1012,16 @@ def process_pdf_ocr(
 
 
 # ============================================================
-# PDF BACKGROUND PROCESSOR
+# BACKGROUND PROCESS
 # ============================================================
 
 def process_pdf_background(
     pdf_path
 ):
 
-    try:
-
-        return process_pdf_ocr(
-            pdf_path
-        )
-
-    finally:
-
-        if os.path.exists(
-            pdf_path
-        ):
-
-            try:
-
-                os.remove(
-                    pdf_path
-                )
-
-            except Exception:
-
-                pass
+    return process_pdf_ocr(
+        pdf_path
+    )
 
 
 # ============================================================
@@ -1409,17 +1037,12 @@ async def handle_pdf(
         update.effective_user.id
     )
 
-
     if not context.user_data.get(
         "waiting_for_pdf"
     ):
 
         return
 
-
-    # =========================================================
-    # USER LOCK
-    # =========================================================
 
     with PROCESSING_LOCK:
 
@@ -1429,12 +1052,10 @@ async def handle_pdf(
 
                 "⏳ သင့် PDF ကို "
                 "လုပ်နေပြီးသားပါ။\n\n"
-
                 "ပြီးအောင် စောင့်ပေးပါ။"
             )
 
             return
-
 
         PROCESSING_USERS.add(
             user_id
@@ -1444,7 +1065,6 @@ async def handle_pdf(
     document = (
         update.message.document
     )
-
 
     if not document:
 
@@ -1474,7 +1094,6 @@ async def handle_pdf(
             )
 
         await update.message.reply_text(
-
             "❌ PDF ဖိုင်ပဲ ပို့ပေးပါ။"
         )
 
@@ -1484,8 +1103,8 @@ async def handle_pdf(
     processing_message = (
         await update.message.reply_text(
 
-            "⏳ PDF ကို download "
-            "လုပ်နေပါတယ်..."
+            "⏳ PDF ကို "
+            "စစ်ဆေးနေပါတယ်..."
         )
     )
 
@@ -1496,73 +1115,82 @@ async def handle_pdf(
 
     try:
 
-        # =====================================================
-        # DOWNLOAD
-        # =====================================================
+        # ----------------------------------------------------
+        # Download
+        # ----------------------------------------------------
 
         telegram_file = (
-
             await context.bot.get_file(
                 document.file_id
             )
         )
 
-
         input_path = tempfile.mktemp(
             suffix=".pdf"
         )
-
 
         await telegram_file.download_to_drive(
             input_path
         )
 
-
         print(
-            "PDF downloaded:",
-            filename
+            f"PDF downloaded: "
+            f"{filename}"
         )
 
 
-        # =====================================================
-        # NORMAL TEXT EXTRACTION
-        # =====================================================
+        # ----------------------------------------------------
+        # NORMAL EXTRACTION
+        # ----------------------------------------------------
 
         await processing_message.edit_text(
 
             "📄 PDF စာသားကို "
-            "အရင် Extract လုပ်နေပါတယ်..."
+            "အရင်စစ်နေပါတယ်..."
         )
 
 
         normal_text = (
-            extract_pdf_text(
+            await asyncio.to_thread(
+                extract_pdf_text,
                 input_path
             )
         )
 
 
-        normal_text = (
-            clean_myanmar_text(
+        # ----------------------------------------------------
+        # IMPORTANT:
+        # Check Myanmar text quality
+        # ----------------------------------------------------
+
+        normal_bad = (
+            is_myanmar_text_bad(
                 normal_text
             )
         )
 
 
-        # =====================================================
-        # NORMAL PDF
-        # =====================================================
+        # ----------------------------------------------------
+        # NORMAL PDF ACCEPT
+        # ----------------------------------------------------
 
-        if len(
-            normal_text.strip()
-        ) >= 100:
+        if (
+            len(
+                normal_text.strip()
+            ) >= 100
+            and not normal_bad
+        ):
+
+            print(
+                "Normal extraction "
+                "accepted."
+            )
 
             output_path = (
                 tempfile.mktemp(
                     suffix=".txt"
                 )
             )
-
 
             with open(
                 output_path,
@@ -1589,107 +1217,108 @@ async def handle_pdf(
                 document=output_path,
 
                 caption=(
-
                     "✅ PDF → Text ပြီးပါပြီ။\n\n"
-
-                    "📄 Normal PDF text extraction "
-                    "အသုံးပြုထားပါတယ်။"
+                    "📄 Normal PDF text "
+                    "extraction အသုံးပြုထားပါတယ်။"
                 )
             )
-
-
-            try:
-
-                os.remove(
-                    output_path
-                )
-
-            except Exception:
-
-                pass
-
-
-            output_path = None
-
 
             context.user_data[
                 "waiting_for_pdf"
             ] = False
 
-
             return
 
 
-        # =====================================================
-        # OCR REQUIRED
-        # =====================================================
+        # ----------------------------------------------------
+        # OCR FALLBACK
+        # ----------------------------------------------------
+
+        print(
+            "Normal extraction rejected."
+        )
+
+        print(
+            "Starting Myanmar OCR..."
+        )
+
 
         pdf = fitz.open(
             input_path
         )
 
-
         total_pages = len(
             pdf
         )
-
 
         pdf.close()
 
 
         await processing_message.edit_text(
 
-            "🔎 Scanned PDF ဖြစ်နိုင်ပါတယ်။\n\n"
+            "🔎 Myanmar PDF encoding "
+            "မမှန်နိုင်ပါ သို့မဟုတ် "
+            "Scanned PDF ဖြစ်နိုင်ပါတယ်။\n\n"
 
-            "🇲🇲 Myanmar OCR နဲ့ "
-            "စာဖတ်နေပါတယ်...\n\n"
+            "🇲🇲 Myanmar OCR "
+            "စတင်နေပါတယ်...\n\n"
 
-            f"📄 Pages: {total_pages}\n\n"
+            f"📄 Total pages: "
+            f"{total_pages}\n\n"
 
             "⏳ Page တစ်မျက်နှာချင်းစီ "
-            "လုပ်နေပါတယ်။\n\n"
-
-            "🔄 413 / 429 ဖြစ်ရင် "
-            "အလိုအလျောက် retry လုပ်ပါမယ်။"
+            "လုပ်နေပါတယ်။"
         )
 
 
-        # =====================================================
-        # RUN OCR IN BACKGROUND
-        # =====================================================
+        # ----------------------------------------------------
+        # OCR
+        # ----------------------------------------------------
 
         result, failed_pages = (
             await asyncio.to_thread(
-
                 process_pdf_background,
-
                 input_path
             )
         )
 
 
-        input_path = None
+        # ----------------------------------------------------
+        # Delete input
+        # ----------------------------------------------------
+
+        if (
+            input_path
+            and os.path.exists(
+                input_path
+            )
+        ):
+
+            os.remove(
+                input_path
+            )
+
+            input_path = None
 
 
         if not result.strip():
 
             await processing_message.edit_text(
 
-                "❌ PDF ထဲက စာကို "
-                "မဖတ်နိုင်ပါ။"
+                "❌ OCR နဲ့ပါ "
+                "စာမဖတ်နိုင်ပါ။"
             )
 
             return
 
 
-        # =====================================================
+        # ----------------------------------------------------
         # TXT
-        # =====================================================
+        # ----------------------------------------------------
 
         output_path = tempfile.mktemp(
             suffix=".txt"
         )
-
 
         with open(
             output_path,
@@ -1711,9 +1340,9 @@ async def handle_pdf(
             pass
 
 
-        # =====================================================
-        # CAPTION
-        # =====================================================
+        # ----------------------------------------------------
+        # Caption
+        # ----------------------------------------------------
 
         if failed_pages:
 
@@ -1722,13 +1351,12 @@ async def handle_pdf(
                 for x in failed_pages
             )
 
-
             caption = (
 
                 "⚠️ PDF → Text ပြီးပါပြီ။\n\n"
 
-                "🇲🇲 Myanmar OCR + "
-                "Text Cleanup အသုံးပြုထားပါတယ်။\n\n"
+                "🇲🇲 Myanmar OCR "
+                "အသုံးပြုထားပါတယ်။\n\n"
 
                 f"⚠️ OCR မအောင်မြင်သော page: "
                 f"{failed_text}"
@@ -1740,14 +1368,10 @@ async def handle_pdf(
 
                 "✅ PDF → Text ပြီးပါပြီ။\n\n"
 
-                "🇲🇲 Myanmar OCR + "
-                "Text Cleanup အသုံးပြုထားပါတယ်။"
+                "🇲🇲 Myanmar OCR "
+                "အသုံးပြုထားပါတယ်။"
             )
 
-
-        # =====================================================
-        # SEND TXT
-        # =====================================================
 
         await update.message.reply_document(
 
@@ -1755,24 +1379,6 @@ async def handle_pdf(
 
             caption=caption
         )
-
-
-        # =====================================================
-        # CLEAN FILE
-        # =====================================================
-
-        try:
-
-            os.remove(
-                output_path
-            )
-
-        except Exception:
-
-            pass
-
-
-        output_path = None
 
 
         context.user_data[
@@ -1792,7 +1398,6 @@ async def handle_pdf(
             repr(e)
         )
 
-
         try:
 
             await processing_message.edit_text(
@@ -1801,7 +1406,7 @@ async def handle_pdf(
                 "မအောင်မြင်ပါ။\n\n"
 
                 f"Error:\n"
-                f"{str(e)[:800]}"
+                f"{str(e)[:1000]}"
             )
 
         except Exception:
@@ -1810,10 +1415,6 @@ async def handle_pdf(
 
 
     finally:
-
-        # -----------------------------------------------------
-        # Remove input
-        # -----------------------------------------------------
 
         if (
             input_path
@@ -1833,10 +1434,6 @@ async def handle_pdf(
                 pass
 
 
-        # -----------------------------------------------------
-        # Remove output
-        # -----------------------------------------------------
-
         if (
             output_path
             and os.path.exists(
@@ -1855,10 +1452,6 @@ async def handle_pdf(
                 pass
 
 
-        # -----------------------------------------------------
-        # Release user lock
-        # -----------------------------------------------------
-
         with PROCESSING_LOCK:
 
             PROCESSING_USERS.discard(
@@ -1875,11 +1468,9 @@ async def error_handler(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    error = context.error
-
     print(
         "Telegram error:",
-        repr(error)
+        repr(context.error)
     )
 
 
@@ -1890,67 +1481,40 @@ async def error_handler(
 def main():
 
     print(
-        "===================================="
+        "Bot application starting..."
     )
 
-    print(
-        "AI PDF Helper Bot starting..."
-    )
-
-    print(
-        "===================================="
-    )
-
-
-    # ========================================================
-    # BOT TOKEN
-    # ========================================================
 
     if not BOT_TOKEN:
 
         raise ValueError(
-
             "BOT_TOKEN မတွေ့ပါ။"
         )
 
 
-    # ========================================================
-    # OCR KEY
-    # ========================================================
-
     if not OCR_API_KEY:
 
         print(
-
-            "WARNING: OCR_API_KEY "
-            "မတွေ့ပါ။"
-        )
-
-    else:
-
-        print(
-            "OCR_API_KEY detected."
+            "WARNING: "
+            "OCR_API_KEY မတွေ့ပါ။"
         )
 
 
-    # ========================================================
-    # RENDER HEALTH SERVER
-    # ========================================================
+    # --------------------------------------------------------
+    # Render health server
+    # --------------------------------------------------------
 
     threading.Thread(
-
         target=start_health_server,
-
         daemon=True
     ).start()
 
 
-    # ========================================================
-    # TELEGRAM APP
-    # ========================================================
+    # --------------------------------------------------------
+    # Telegram
+    # --------------------------------------------------------
 
     app = (
-
         Application
         .builder()
         .token(BOT_TOKEN)
@@ -1958,12 +1522,7 @@ def main():
     )
 
 
-    # ========================================================
-    # HANDLERS
-    # ========================================================
-
     app.add_handler(
-
         CommandHandler(
             "start",
             start
@@ -1972,7 +1531,6 @@ def main():
 
 
     app.add_handler(
-
         CallbackQueryHandler(
             button_handler
         )
@@ -1980,11 +1538,8 @@ def main():
 
 
     app.add_handler(
-
         MessageHandler(
-
             filters.Document.PDF,
-
             handle_pdf
         )
     )
@@ -2000,12 +1555,10 @@ def main():
     )
 
 
-    # ========================================================
-    # POLLING
-    # ========================================================
-
+    # IMPORTANT:
+    # Render + Telegram polling
+    # Webhook မသုံးပါ
     app.run_polling(
-
         drop_pending_updates=True
     )
 
