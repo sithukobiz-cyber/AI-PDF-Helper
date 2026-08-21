@@ -1301,40 +1301,103 @@ def main_keyboard():
         [
             InlineKeyboardButton(
                 "📄 PDF Tools",
-                callback_data="pdf"
+                callback_data="menu_pdf"
             ),
             InlineKeyboardButton(
                 "🤖 AI Tools",
-                callback_data="ai"
+                callback_data="menu_ai"
             ),
         ],
 
         [
             InlineKeyboardButton(
                 "🔎 Search",
-                callback_data="search_menu"
+                callback_data="menu_search"
             ),
             InlineKeyboardButton(
                 "🌤️ Weather",
-                callback_data="weather_menu"
+                callback_data="menu_weather"
             ),
         ],
+    if data == "menu_weather":
 
+        await query.edit_message_text(
+            "🌤 Weather\n\n"
+            "မြို့/နိုင်ငံကို ရိုက်ပို့ပါ။\n\n"
+            "ဥပမာ:\n"
+            "/weather Yangon\n"
+            "/weather Mandalay\n"
+            "/weather Tokyo\n"
+            "/weather London",
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "🔙 Main Menu",
+                        callback_data="main_menu"
+                    )
+                ]
+            ])
+        )
+
+        return
+
+
+    if data == "menu_rate":
+
+        await query.edit_message_text(
+            "💱 Exchange Rate\n\n"
+            "ငွေကြေး ၂ မျိုးထည့်ပါ။\n\n"
+            "ဥပမာ:\n"
+            "/rate USD MMK\n"
+            "/rate EUR USD\n"
+            "/rate GBP USD\n"
+            "/rate USD JPY\n"
+            "/rate USD CNY",
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "🔙 Main Menu",
+                        callback_data="main_menu"
+                    )
+                ]
+            ])
+        )
+
+        return
+    if data == "menu_search":
+
+        await query.edit_message_text(
+            "🔎 Database Search\n\n"
+            "ရှာချင်တဲ့စာကို ပို့ပါ။\n\n"
+            "ဥပမာ:\n"
+            "/search sesame\n"
+            "/search fertilizer",
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "🔙 Main Menu",
+                        callback_data="main_menu"
+                    )
+                ]
+            ])
+        )
+
+        return
         [
             InlineKeyboardButton(
                 "💱 Exchange Rate",
-                callback_data="rate_menu"
+                callback_data="menu_rate"
             ),
             InlineKeyboardButton(
                 "⏰ Reminder",
-                callback_data="reminder_menu"
+                callback_data="menu_remind"
             ),
         ],
 
         [
             InlineKeyboardButton(
                 "📚 Study",
-                callback_data="study_menu"
+                callback_data="menu_study"
             ),
         ],
 
