@@ -5,6 +5,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import requests
 import fitz
+from PIL import Image
 from pypdf import PdfReader
 
 from telegram import (
@@ -44,10 +45,12 @@ class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
 
         self.send_response(200)
+
         self.send_header(
             "Content-Type",
             "text/plain; charset=utf-8"
         )
+
         self.end_headers()
 
         self.wfile.write(
@@ -163,7 +166,6 @@ async def button_handler(
 
         ])
 
-
         await query.edit_message_text(
 
             "📄 PDF Tools\n\n"
@@ -183,7 +185,6 @@ async def button_handler(
         context.user_data[
             "waiting_for_pdf"
         ] = True
-
 
         await query.edit_message_text(
 
@@ -276,19 +277,17 @@ def extract_pdf_text(pdf_path):
 
         text_parts = []
 
-
         for page_number, page in enumerate(
             reader.pages,
             start=1
         ):
 
             print(
-                f"Extracting page {page_number}"
+                f"Extracting PDF page "
+                f"{page_number}"
             )
 
-
             page_text = page.extract_text()
-
 
             if page_text:
 
@@ -296,20 +295,16 @@ def extract_pdf_text(pdf_path):
                     page_text
                 )
 
-
         text = "\n".join(
             text_parts
         ).strip()
-
 
         print(
             "Normal text length:",
             len(text)
         )
 
-
         return text
-
 
     except Exception as e:
 
@@ -340,42 +335,53 @@ def ocr_image(image_path):
     )
 
 
-    with open(
-        image_path,
-        "rb"
-    ) as image_file:
+    try:
 
-        response = requests.post(
+        with open(
+            image_path,
+            "rb"
+        ) as image_file:
 
-            OCR_URL,
+            response = requests.post(
 
-            headers={
-                "apikey": OCR_API_KEY
-            },
+                OCR_URL,
 
-            files={
-                "file": (
-                    "page.png",
-                    image_file,
-                    "image/png"
-                )
-            },
+                headers={
+                    "apikey": OCR_API_KEY
+                },
 
-            data={
+                files={
+                    "file": (
+                        "page.jpg",
+                        image_file,
+                        "image/jpeg"
+                    )
+                },
 
-                "language": "mya",
+                data={
 
-                "OCREngine": "3",
+                    # Myanmar
+                    "language": "mya",
 
-                "isOverlayRequired": "false",
+                    # OCR Engine 3
+                    "OCREngine": "3",
 
-                "detectOrientation": "true",
+                    "isOverlayRequired": "false",
 
-                "scale": "true",
+                    "detectOrientation": "true",
 
-            },
+                    "scale": "true",
 
-            timeout=180
+                },
+
+                timeout=180
+            )
+
+
+    except requests.RequestException as e:
+
+        raise Exception(
+            f"OCR network error: {e}"
         )
 
 
@@ -388,12 +394,26 @@ def ocr_image(image_path):
     if response.status_code != 200:
 
         raise Exception(
-            f"OCR API HTTP {response.status_code}"
+            f"OCR API HTTP "
+            f"{response.status_code}"
         )
 
 
-    result = response.json()
+    try:
 
+        result = response.json()
+
+    except Exception:
+
+        raise Exception(
+            "OCR API က JSON response "
+            "မပေးပါ။"
+        )
+
+
+    # -----------------------------------------------------
+    # OCR API ERROR
+    # -----------------------------------------------------
 
     if result.get(
         "IsErroredOnProcessing"
@@ -420,6 +440,10 @@ def ocr_image(image_path):
             str(error_message)
         )
 
+
+    # -----------------------------------------------------
+    # OCR RESULTS
+    # -----------------------------------------------------
 
     parsed_results = result.get(
         "ParsedResults",
@@ -460,10 +484,13 @@ def ocr_image(image_path):
 
 
 # =========================================================
-# PDF OCR
+# PDF → OCR
 # =========================================================
 
-def process_pdf_with_ocr(pdf_path):
+def process_pdf_with_ocr(
+    pdf_path,
+    progress_callback=None
+):
 
     pdf = fitz.open(
         pdf_path
@@ -478,7 +505,8 @@ def process_pdf_with_ocr(pdf_path):
 
 
         print(
-            f"OCR starting: {total_pages} page(s)"
+            f"OCR starting: "
+            f"{total_pages} page(s)"
         )
 
 
@@ -486,11 +514,28 @@ def process_pdf_with_ocr(pdf_path):
             total_pages
         ):
 
+            current_page = (
+                page_number + 1
+            )
+
+
             print(
                 f"OCR page "
-                f"{page_number + 1}/"
+                f"{current_page}/"
                 f"{total_pages}"
             )
+
+
+            # -------------------------------------------------
+            # Progress callback
+            # -------------------------------------------------
+
+            if progress_callback:
+
+                progress_callback(
+                    current_page,
+                    total_pages
+                )
 
 
             page = pdf[
@@ -498,31 +543,140 @@ def process_pdf_with_ocr(pdf_path):
             ]
 
 
+            # -------------------------------------------------
+            # Render PDF page
+            #
+            # 2.0x is used instead of 3.0x
+            # to avoid HTTP 413.
+            # -------------------------------------------------
+
             pix = page.get_pixmap(
 
                 matrix=fitz.Matrix(
-                    1.5,
-                    1.5
+                    2.0,
+                    2.0
                 ),
 
                 alpha=False
             )
 
 
-            image_path = tempfile.mktemp(
+            png_path = tempfile.mktemp(
                 suffix=".png"
+            )
+
+
+            jpg_path = tempfile.mktemp(
+                suffix=".jpg"
             )
 
 
             try:
 
+                # -------------------------------------------------
+                # Save temporary PNG
+                # -------------------------------------------------
+
                 pix.save(
-                    image_path
+                    png_path
                 )
 
 
+                # -------------------------------------------------
+                # Convert PNG → JPEG
+                #
+                # JPEG significantly reduces
+                # request size.
+                # -------------------------------------------------
+
+                image = Image.open(
+                    png_path
+                )
+
+
+                image = image.convert(
+                    "RGB"
+                )
+
+
+                # -------------------------------------------------
+                # Limit very large dimensions
+                # -------------------------------------------------
+
+                max_dimension = 3000
+
+
+                width, height = (
+                    image.size
+                )
+
+
+                if max(
+                    width,
+                    height
+                ) > max_dimension:
+
+                    scale = (
+                        max_dimension
+                        /
+                        max(
+                            width,
+                            height
+                        )
+                    )
+
+
+                    new_size = (
+
+                        int(
+                            width * scale
+                        ),
+
+                        int(
+                            height * scale
+                        )
+                    )
+
+
+                    image = image.resize(
+                        new_size,
+                        Image.Resampling.LANCZOS
+                    )
+
+
+                # -------------------------------------------------
+                # Save compressed JPEG
+                # -------------------------------------------------
+
+                image.save(
+
+                    jpg_path,
+
+                    format="JPEG",
+
+                    quality=85,
+
+                    optimize=True
+                )
+
+
+                file_size = os.path.getsize(
+                    jpg_path
+                )
+
+
+                print(
+                    f"OCR image size: "
+                    f"{file_size / 1024:.1f} KB"
+                )
+
+
+                # -------------------------------------------------
+                # OCR
+                # -------------------------------------------------
+
                 text = ocr_image(
-                    image_path
+                    jpg_path
                 )
 
 
@@ -531,22 +685,40 @@ def process_pdf_with_ocr(pdf_path):
                     all_text.append(
 
                         f"\n--- Page "
-                        f"{page_number + 1} ---\n"
+                        f"{current_page} ---\n"
                     )
+
 
                     all_text.append(
                         text
                     )
 
 
+                else:
+
+                    print(
+                        f"No OCR text on "
+                        f"page {current_page}"
+                    )
+
+
             finally:
 
                 if os.path.exists(
-                    image_path
+                    png_path
                 ):
 
                     os.remove(
-                        image_path
+                        png_path
+                    )
+
+
+                if os.path.exists(
+                    jpg_path
+                ):
+
+                    os.remove(
+                        jpg_path
                     )
 
 
@@ -626,7 +798,7 @@ async def handle_pdf(
     try:
 
         # -------------------------------------------------
-        # Download
+        # Download PDF
         # -------------------------------------------------
 
         print(
@@ -658,7 +830,7 @@ async def handle_pdf(
 
 
         # -------------------------------------------------
-        # Normal extraction
+        # Normal text extraction
         # -------------------------------------------------
 
         text = extract_pdf_text(
@@ -682,7 +854,8 @@ async def handle_pdf(
                 "🧠 Myanmar OCR နဲ့ "
                 "စာဖတ်နေပါတယ်...\n\n"
 
-                "⏳ ခဏစောင့်ပါ။"
+                "⏳ Page တစ်မျက်နှာချင်းစီ "
+                "စစ်နေပါတယ်။"
             )
 
 
@@ -692,7 +865,7 @@ async def handle_pdf(
 
 
         # -------------------------------------------------
-        # No text
+        # No result
         # -------------------------------------------------
 
         if not text.strip():
@@ -700,7 +873,10 @@ async def handle_pdf(
             await processing_message.edit_text(
 
                 "❌ PDF ထဲက စာကို "
-                "ဖတ်မရပါ။"
+                "ဖတ်မရပါ။\n\n"
+
+                "PDF scan quality ကို "
+                "စစ်ကြည့်ပါ။"
             )
 
             return
@@ -730,6 +906,10 @@ async def handle_pdf(
             )
 
 
+        # -------------------------------------------------
+        # Delete processing message
+        # -------------------------------------------------
+
         try:
 
             await processing_message.delete()
@@ -748,8 +928,10 @@ async def handle_pdf(
             document=output_path,
 
             caption=(
+
                 "✅ PDF → Text ပြီးပါပြီ။\n"
-                "🇲🇲 Myanmar OCR ပါဝင်ပါတယ်။"
+
+                "🇲🇲 Myanmar OCR အသုံးပြုထားပါတယ်။"
             )
         )
 
@@ -766,6 +948,7 @@ async def handle_pdf(
 
     except Exception as e:
 
+
         print(
             "PDF PROCESSING ERROR:",
             repr(e)
@@ -779,7 +962,8 @@ async def handle_pdf(
                 "❌ PDF processing "
                 "မအောင်မြင်ပါ။\n\n"
 
-                f"Error: {str(e)[:800]}"
+                f"Error:\n"
+                f"{str(e)[:800]}"
             )
 
         except Exception:
@@ -788,6 +972,11 @@ async def handle_pdf(
 
 
     finally:
+
+
+        # -------------------------------------------------
+        # Delete temporary PDF
+        # -------------------------------------------------
 
         if (
             input_path
@@ -800,6 +989,10 @@ async def handle_pdf(
                 input_path
             )
 
+
+        # -------------------------------------------------
+        # Delete temporary TXT
+        # -------------------------------------------------
 
         if (
             output_path
@@ -834,6 +1027,11 @@ async def error_handler(
 
 def main():
 
+    print(
+        "Bot application starting..."
+    )
+
+
     if not BOT_TOKEN:
 
         raise ValueError(
@@ -841,92 +1039,8 @@ def main():
         )
 
 
-    print(
-        "Starting Render health server..."
-    )
+    if not OCR_API_KEY:
 
-
-    # -----------------------------------------------------
-    # Health server
-    # -----------------------------------------------------
-
-    health_thread = threading.Thread(
-
-        target=start_health_server,
-
-        daemon=True
-    )
-
-    health_thread.start()
-
-
-    # -----------------------------------------------------
-    # Telegram application
-    # -----------------------------------------------------
-
-    app = (
-
-        Application
-        .builder()
-        .token(BOT_TOKEN)
-        .build()
-    )
-
-
-    # -----------------------------------------------------
-    # Handlers
-    # -----------------------------------------------------
-
-    app.add_handler(
-
-        CommandHandler(
-            "start",
-            start
-        )
-    )
-
-
-    app.add_handler(
-
-        CallbackQueryHandler(
-            button_handler
-        )
-    )
-
-
-    app.add_handler(
-
-        MessageHandler(
-            filters.Document.PDF,
-            handle_pdf
-        )
-    )
-
-
-    app.add_error_handler(
-        error_handler
-    )
-
-
-    print(
-        "Bot is running..."
-    )
-
-
-    # -----------------------------------------------------
-    # POLLING
-    # -----------------------------------------------------
-
-    app.run_polling(
-
-        drop_pending_updates=True
-    )
-
-
-# =========================================================
-# START
-# =========================================================
-
-if __name__ == "__main__":
-
-    main()
+        print(
+            "WARNING: OCR_API_KEY မတွေ့ပါ။"
+    
