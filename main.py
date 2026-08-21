@@ -1296,36 +1296,56 @@ async def process_pdf_file(
 
 def main_keyboard():
 
-    return InlineKeyboardMarkup(
+    return InlineKeyboardMarkup([
+
         [
-            [
-                InlineKeyboardButton(
-                    "📄 PDF Tools",
-                    callback_data="menu_pdf"
-                ),
-                InlineKeyboardButton(
-                    "🤖 AI Tools",
-                    callback_data="menu_ai"
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    "📚 Study",
-                    callback_data="menu_study"
-                ),
-                InlineKeyboardButton(
-                    "⏰ Reminder",
-                    callback_data="menu_remind"
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    "ℹ️ Help",
-                    callback_data="menu_help"
-                ),
-            ],
-        ]
-    )
+            InlineKeyboardButton(
+                "📄 PDF Tools",
+                callback_data="pdf"
+            ),
+            InlineKeyboardButton(
+                "🤖 AI Tools",
+                callback_data="ai"
+            ),
+        ],
+
+        [
+            InlineKeyboardButton(
+                "🔎 Search",
+                callback_data="search_menu"
+            ),
+            InlineKeyboardButton(
+                "🌤️ Weather",
+                callback_data="weather_menu"
+            ),
+        ],
+
+        [
+            InlineKeyboardButton(
+                "💱 Exchange Rate",
+                callback_data="rate_menu"
+            ),
+            InlineKeyboardButton(
+                "⏰ Reminder",
+                callback_data="reminder_menu"
+            ),
+        ],
+
+        [
+            InlineKeyboardButton(
+                "📚 Study",
+                callback_data="study_menu"
+            ),
+        ],
+
+        [
+            InlineKeyboardButton(
+                "ℹ️ Help",
+                callback_data="help"
+            ),
+        ],
+
+    ])
 
 
 # ============================================================
@@ -1548,108 +1568,161 @@ async def button_handler(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
-
     query = update.callback_query
 
     await query.answer()
 
-    if query.data == "main_menu":
+    data = query.data
 
+    # ========================================================
+    # MAIN MENU
+    # ========================================================
+
+    if data == "main_menu":
         await query.edit_message_text(
             "🤖 AI PDF Helper\n\n"
             "Main Menu 👇",
             reply_markup=main_keyboard()
         )
-
         return
 
-    if query.data == "menu_pdf":
+    # ========================================================
+    # PDF MENU
+    # ========================================================
 
-        await pdf_menu(
-            query
-        )
-
+    if data == "menu_pdf":
+        await pdf_menu(query)
         return
 
-    if query.data == "menu_ai":
+    # ========================================================
+    # AI MENU
+    # ========================================================
 
-        await ai_menu(
-            query
-        )
-
+    if data == "menu_ai":
+        await ai_menu(query)
         return
 
-    if query.data == "menu_study":
+    # ========================================================
+    # STUDY MENU
+    # ========================================================
 
-        await study_menu(
-            query
-        )
-
+    if data == "menu_study":
+        await study_menu(query)
         return
 
-    if query.data == "menu_remind":
+    # ========================================================
+    # REMINDER MENU
+    # ========================================================
 
-        await remind_menu(
-            query
-        )
-
+    if data == "menu_remind":
+        await remind_menu(query)
         return
 
-    if query.data == "menu_help":
+    # ========================================================
+    # HELP
+    # ========================================================
 
+    if data == "menu_help":
         await query.edit_message_text(
             "ℹ️ Help\n\n"
-            "/help ကိုသုံးပါ။",
-            reply_markup=InlineKeyboardMarkup(
+            "/start — Main Menu\n"
+            "/search — Database ထဲရှာရန်\n"
+            "/weather — ကမ္ဘာတစ်ဝှမ်း ရာသီဥတု\n"
+            "/rate — ငွေလဲနှုန်း\n"
+            "/remind — Reminder\n"
+            "/study — English / IT / Programming / Quiz / Daily Lesson\n\n"
+            "📄 PDF Tools\n"
+            "→ PDF → Text\n\n"
+            "🤖 AI Tools\n"
+            "→ AI အသုံးပြုနိုင်ပါတယ်။",
+            reply_markup=InlineKeyboardMarkup([
                 [
-                    [
-                        InlineKeyboardButton(
-                            "🔙 Main Menu",
-                            callback_data="main_menu"
-                        )
-                    ]
+                    InlineKeyboardButton(
+                        "🔙 Main Menu",
+                        callback_data="main_menu"
+                    )
                 ]
-            )
+            ])
         )
-
         return
 
-    if query.data == "pdf_to_text":
+    # ========================================================
+    # PDF → TEXT
+    # ========================================================
 
-        context.user_data[
-            "waiting_for_pdf"
-        ] = True
+    if data == "pdf_to_text":
+        context.user_data["waiting_for_pdf"] = True
 
         await query.edit_message_text(
             "📄 PDF → Text\n\n"
             "PDF ဖိုင်တစ်ခု ပို့ပါ။\n\n"
-            "Normal PDF ဖြစ်ရင် text extraction\n"
-            "လုပ်မယ်။\n\n"
-            "Myanmar encoding မမှန်ရင်\n"
-            "Zawgyi/Unicode စစ်ပြီး OCR fallback\n"
-            "လုပ်မယ်။\n\n"
-            "Scanned PDF ဆိုရင် OCR သုံးမယ်။"
+            "📄 Normal PDF\n"
+            "→ Text extraction လုပ်မယ်။\n\n"
+            "🇲🇲 Myanmar PDF\n"
+            "→ Myanmar encoding စစ်မယ်။\n\n"
+            "🖼️ Scanned PDF\n"
+            "→ OCR အသုံးပြုမယ်။"
         )
-
         return
 
-    if query.data.startswith(
-        "study_"
-    ):
+    # ========================================================
+    # STUDY SUBJECTS
+    # ========================================================
 
-        subject = query.data.split(
-            "_",
-            1
-        )[1]
+    if data.startswith("study_"):
+        subject = data.split("_", 1)[1]
 
         await send_study_lesson(
             query,
             context,
             subject
         )
-
         return
 
+    # ========================================================
+    # WEATHER BUTTON
+    # ========================================================
+
+    if data == "weather":
+        await query.edit_message_text(
+            "🌤 Weather\n\n"
+            "မြို့/နိုင်ငံကို ရိုက်ပို့ပါ။\n\n"
+            "ဥပမာ:\n"
+            "/weather Yangon\n"
+            "/weather Mandalay\n"
+            "/weather Tokyo\n"
+            "/weather London\n"
+            "/weather New York"
+        )
+        return
+
+    # ========================================================
+    # RATE BUTTON
+    # ========================================================
+
+    if data == "rate":
+        await query.edit_message_text(
+            "💱 Currency Exchange Rate\n\n"
+            "ငွေကြေး ၂ မျိုးကို ရိုက်ပို့ပါ။\n\n"
+            "ဥပမာ:\n"
+            "/rate USD MMK\n"
+            "/rate EUR USD\n"
+            "/rate GBP USD\n"
+            "/rate USD JPY\n"
+            "/rate USD CNY\n"
+            "/rate SGD MMK\n"
+            "/rate THB MMK"
+        )
+        return
+
+    # ========================================================
+    # UNKNOWN CALLBACK
+    # ========================================================
+
+    await query.answer(
+        "ဒီခလုတ်ကို မသတ်မှတ်ရသေးပါ။",
+        show_alert=True
+    )
 
 # ============================================================
 # WEATHER
