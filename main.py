@@ -1319,47 +1319,7 @@ def main_keyboard():
                 callback_data="menu_weather"
             ),
         ],
-     if data == "menu_rate":
 
-        await query.edit_message_text(
-            "💱 Exchange Rate\n\n"
-            "ငွေကြေး ၂ မျိုးထည့်ပါ။\n\n"
-            "ဥပမာ:\n"
-            "/rate USD MMK\n"
-            "/rate EUR USD\n"
-            "/rate GBP USD\n"
-            "/rate USD JPY\n"
-            "/rate USD CNY",
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        "🔙 Main Menu",
-                        callback_data="main_menu"
-                    )
-                ]
-            ])
-        )
-
-        return
-    if data == "menu_search":
-
-        await query.edit_message_text(
-            "🔎 Database Search\n\n"
-            "ရှာချင်တဲ့စာကို ပို့ပါ။\n\n"
-            "ဥပမာ:\n"
-            "/search sesame\n"
-            "/search fertilizer",
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        "🔙 Main Menu",
-                        callback_data="main_menu"
-                    )
-                ]
-            ])
-        )
-
-        return
         [
             InlineKeyboardButton(
                 "💱 Exchange Rate",
