@@ -2,61 +2,1660 @@ import os
 import io
 import re
 import time
-import asyncio
+import json
+import math
 import sqlite3
+import asyncio
+import logging
 import threading
 import tempfile
-from datetime import datetime, timedelta
-from decimal import Decimal, InvalidOperation
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from zoneinfo import ZoneInfo
 
 import requests
-import fitz
+import pymupdf
 from PIL import Image
-from pypdf import PdfReader
+from icu import Transliterator
+from myanmartools import ZawgyiDetector
+
+from openai import AsyncOpenAI
 
 from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputFile,
 )
+
+from telegram.constants import ChatAction
 
 from telegram.ext import (
     Application,
+    ApplicationBuilder,
     CommandHandler,
     CallbackQueryHandler,
-    ContextTypes,
     MessageHandler,
+    ContextTypes,
     filters,
 )
-
-# Optional AI
-try:
-    from openai import OpenAI
-except Exception:
-    OpenAI = None
 
 
 # ============================================================
 # CONFIG
 # ============================================================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-OCR_API_KEY = os.getenv("OCR_API_KEY")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
-PORT = int(os.getenv("PORT", "10000"))
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
-DB_PATH = os.getenv(
-    "DB_PATH",
-    "bot_database.sqlite3"
+# IMPORTANT:
+# OpenAI model ID must be a model available to your API project.
+# If "gpt-5.6-luna" is not an actual model available to the key,
+# OpenAI will return a model-not-found error.
+OPENAI_MODEL = os.getenv(
+    "OPENAI_MODEL",
+    "gpt-5.6-luna"
+).strip()
+
+OCR_API_KEY = os.getenv(
+    "OCR_API_KEY",
+    ""
+).strip()
+
+PORT = int(
+    os.getenv(
+        "PORT",
+        "10000"
+    )
+)
+
+DATABASE_PATH = os.getenv(
+    "DATABASE_PATH",
+    "bot.db"
+)
+
+TIMEZONE = os.getenv(
+    "TIMEZONE",
+    "Asia/Yangon"
 )
 
 OCR_URL = (
     "https://api.ocr.space/parse/image"
 )
 
-WEATHER_GEO_URL = (
+OCR_TIMEOUT = 120
+
+MAX_TELEGRAM_MESSAGE = 3900
+
+MAX_PDF_SIZE_MB = 50
+
+OCR_REQUEST_DELAY = 1.5
+
+OCR_429_RETRIES = 5
+
+OCR_SETTINGS = [
+    (2200, 70),
+    (2000, 62),
+    (1800, 55),
+    (1600, 48),
+    (1400, 42),
+]
+
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+logging.basicConfig(
+    format=(
+        "%(asctime)s - "
+        "%(name)s - "
+        "%(levelname)s - "
+        "%(message)s"
+    ),
+    level=logging.INFO,
+)
+
+logger = logging.getLogger(
+    "ai-pdf-helper"
+)
+
+
+# ============================================================
+# GLOBAL CLIENTS
+# ============================================================
+
+openai_client = None
+
+if OPENAI_API_KEY:
+
+    openai_client = AsyncOpenAI(
+        api_key=OPENAI_API_KEY
+    )
+
+
+# ============================================================
+# LOCKS
+# ============================================================
+
+DB_LOCK = threading.Lock()
+
+PROCESSING_USERS = set()
+
+PROCESSING_LOCK = threading.Lock()
+
+
+# ============================================================
+# DATABASE
+# ============================================================
+
+def db_connect():
+
+    connection = sqlite3.connect(
+        DATABASE_PATH,
+        timeout=30,
+        check_same_thread=False
+    )
+
+    connection.row_factory = sqlite3.Row
+
+    return connection
+
+
+def init_database():
+
+    with DB_LOCK:
+
+        connection = db_connect()
+
+        cursor = connection.cursor()
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                created_at TEXT NOT NULL,
+                last_seen TEXT NOT NULL
+            )
+            """
+        )
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS documents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                filename TEXT,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS reminders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                text TEXT NOT NULL,
+                remind_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                done INTEGER DEFAULT 0
+            )
+            """
+        )
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS study_progress (
+                user_id INTEGER PRIMARY KEY,
+                subject TEXT,
+                lesson INTEGER DEFAULT 1,
+                score INTEGER DEFAULT 0,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+
+        connection.commit()
+
+        connection.close()
+
+    logger.info(
+        "Database initialized."
+    )
+
+
+def now_iso():
+
+    return datetime.now(
+        timezone.utc
+    ).isoformat()
+
+
+def register_user(user):
+
+    if not user:
+        return
+
+    timestamp = now_iso()
+
+    with DB_LOCK:
+
+        connection = db_connect()
+
+        connection.execute(
+            """
+            INSERT INTO users
+            (
+                user_id,
+                username,
+                first_name,
+                created_at,
+                last_seen
+            )
+            VALUES (?, ?, ?, ?, ?)
+
+            ON CONFLICT(user_id)
+            DO UPDATE SET
+                username=excluded.username,
+                first_name=excluded.first_name,
+                last_seen=excluded.last_seen
+            """,
+            (
+                user.id,
+                user.username or "",
+                user.first_name or "",
+                timestamp,
+                timestamp,
+            )
+        )
+
+        connection.commit()
+
+        connection.close()
+
+
+def save_document(
+    user_id,
+    filename,
+    content
+):
+
+    with DB_LOCK:
+
+        connection = db_connect()
+
+        cursor = connection.cursor()
+
+        cursor.execute(
+            """
+            INSERT INTO documents
+            (
+                user_id,
+                filename,
+                content,
+                created_at
+            )
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                user_id,
+                filename,
+                content,
+                now_iso(),
+            )
+        )
+
+        document_id = cursor.lastrowid
+
+        connection.commit()
+
+        connection.close()
+
+    return document_id
+
+
+def search_documents(
+    user_id,
+    keyword,
+    limit=10
+):
+
+    keyword = keyword.strip()
+
+    if not keyword:
+        return []
+
+    with DB_LOCK:
+
+        connection = db_connect()
+
+        rows = connection.execute(
+            """
+            SELECT
+                id,
+                filename,
+                content,
+                created_at
+            FROM documents
+            WHERE user_id = ?
+              AND content LIKE ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (
+                user_id,
+                f"%{keyword}%",
+                limit,
+            )
+        ).fetchall()
+
+        connection.close()
+
+    return rows
+
+
+# ============================================================
+# UTILITY
+# ============================================================
+
+def split_message(
+    text,
+    limit=MAX_TELEGRAM_MESSAGE
+):
+
+    if not text:
+        return []
+
+    text = str(text)
+
+    chunks = []
+
+    while len(text) > limit:
+
+        cut = text.rfind(
+            "\n",
+            0,
+            limit
+        )
+
+        if cut < 1000:
+            cut = limit
+
+        chunks.append(
+            text[:cut]
+        )
+
+        text = text[cut:].lstrip()
+
+    if text:
+        chunks.append(text)
+
+    return chunks
+
+
+async def send_long_message(
+    update,
+    text
+):
+
+    if not text:
+        return
+
+    for chunk in split_message(text):
+
+        await update.message.reply_text(
+            chunk
+        )
+
+
+def clean_text(text):
+
+    if not text:
+        return ""
+
+    text = text.replace(
+        "\x00",
+        ""
+    )
+
+    return text.strip()
+
+
+# ============================================================
+# MYANMAR UNICODE / ZAWGYI
+# ============================================================
+
+try:
+
+    ZAWGYI_DETECTOR = (
+        ZawgyiDetector()
+    )
+
+except Exception as error:
+
+    logger.warning(
+        "Zawgyi detector unavailable: %s",
+        error
+    )
+
+    ZAWGYI_DETECTOR = None
+
+
+try:
+
+    ZAWGYI_TO_UNICODE = (
+        Transliterator.createInstance(
+            "Zawgyi-my"
+        )
+    )
+
+except Exception as error:
+
+    logger.warning(
+        "ICU Zawgyi converter unavailable: %s",
+        error
+    )
+
+    ZAWGYI_TO_UNICODE = None
+
+
+def convert_myanmar_to_unicode(
+    text
+):
+
+    if not text:
+        return ""
+
+    if (
+        ZAWGYI_DETECTOR
+        and ZAWGYI_TO_UNICODE
+    ):
+
+        try:
+
+            score = (
+                ZAWGYI_DETECTOR
+                .get_zawgyi_probability(
+                    text
+                )
+            )
+
+            if score >= 0.75:
+
+                logger.info(
+                    "Zawgyi detected: %.3f",
+                    score
+                )
+
+                return (
+                    ZAWGYI_TO_UNICODE
+                    .transliterate(text)
+                )
+
+        except Exception as error:
+
+            logger.warning(
+                "Myanmar conversion error: %s",
+                error
+            )
+
+    return text
+
+
+def count_myanmar(text):
+
+    return sum(
+        1
+        for character in text
+        if 0x1000 <= ord(character) <= 0x109F
+    )
+
+
+def text_quality_score(text):
+
+    if not text:
+        return 0.0
+
+    text = clean_text(text)
+
+    if not text:
+        return 0.0
+
+    total = len(text)
+
+    myanmar = count_myanmar(text)
+
+    suspicious_patterns = [
+        "ေြ",
+        "ြေ",
+        "်ေ",
+        "ေျ",
+        "ြ်",
+        "ဴ",
+        "ဵ",
+        "�",
+    ]
+
+    suspicious = sum(
+        text.count(pattern)
+        for pattern in suspicious_patterns
+    )
+
+    score = 0.0
+
+    if myanmar > 0:
+        score += min(
+            myanmar / max(total * 0.15, 1),
+            1.0
+        ) * 0.6
+
+    if suspicious:
+        score -= min(
+            suspicious / 100,
+            0.5
+        )
+
+    if "\ufffd" in text:
+        score -= 0.5
+
+    return max(
+        0.0,
+        min(
+            1.0,
+            score
+        )
+    )
+
+
+def is_text_bad(text):
+
+    if not text:
+        return True
+
+    text = clean_text(text)
+
+    if len(text) < 100:
+        return True
+
+    if "\ufffd" in text:
+        return True
+
+    myanmar = count_myanmar(text)
+
+    suspicious = sum(
+        text.count(pattern)
+        for pattern in [
+            "ေြ",
+            "ြေ",
+            "်ေ",
+            "ေျ",
+            "ြ်",
+        ]
+    )
+
+    # Myanmar document
+    if myanmar >= 20:
+
+        if suspicious >= 5:
+            return True
+
+        if text_quality_score(text) < 0.25:
+            return True
+
+    return False
+
+
+# ============================================================
+# PDF NORMAL EXTRACTION
+# ============================================================
+
+def extract_pdf_text(
+    pdf_path
+):
+
+    parts = []
+
+    try:
+
+        document = pymupdf.open(
+            pdf_path
+        )
+
+        for page_number in range(
+            len(document)
+        ):
+
+            page = document[
+                page_number
+            ]
+
+            text = page.get_text(
+                "text"
+            )
+
+            if text:
+
+                parts.append(
+                    text
+                )
+
+        document.close()
+
+    except Exception as error:
+
+        logger.exception(
+            "PDF extraction error"
+        )
+
+        return ""
+
+    result = "\n".join(
+        parts
+    )
+
+    result = convert_myanmar_to_unicode(
+        result
+    )
+
+    result = clean_text(
+        result
+    )
+
+    logger.info(
+        "Normal PDF text length: %s",
+        len(result)
+    )
+
+    return result
+
+
+# ============================================================
+# OCR IMAGE
+# ============================================================
+
+def create_ocr_image(
+    page,
+    max_dimension,
+    quality
+):
+
+    pixmap = page.get_pixmap(
+        matrix=pymupdf.Matrix(
+            2.0,
+            2.0
+        ),
+        alpha=False
+    )
+
+    image = Image.frombytes(
+        "RGB",
+        (
+            pixmap.width,
+            pixmap.height
+        ),
+        pixmap.samples
+    )
+
+    width, height = image.size
+
+    largest = max(
+        width,
+        height
+    )
+
+    if largest > max_dimension:
+
+        scale = (
+            max_dimension
+            / largest
+        )
+
+        image = image.resize(
+            (
+                max(
+                    1,
+                    int(width * scale)
+                ),
+                max(
+                    1,
+                    int(height * scale)
+                )
+            ),
+            Image.Resampling.LANCZOS
+        )
+
+    buffer = io.BytesIO()
+
+    image.save(
+        buffer,
+        format="JPEG",
+        quality=quality,
+        optimize=True
+    )
+
+    buffer.seek(0)
+
+    return buffer
+
+
+def ocr_request(
+    image_buffer
+):
+
+    image_buffer.seek(0)
+
+    return requests.post(
+        OCR_URL,
+        headers={
+            "apikey": OCR_API_KEY
+        },
+        files={
+            "file": (
+                "page.jpg",
+                image_buffer,
+                "image/jpeg"
+            )
+        },
+        data={
+            "language": "mya",
+            "OCREngine": "3",
+            "isOverlayRequired": "false",
+            "detectOrientation": "true",
+            "scale": "true",
+        },
+        timeout=OCR_TIMEOUT
+    )
+
+
+def ocr_one_page(
+    page,
+    page_number
+):
+
+    if not OCR_API_KEY:
+
+        return (
+            "",
+            "OCR_API_KEY မရှိပါ"
+        )
+
+    last_error = (
+        "Unknown OCR error"
+    )
+
+    for setting_number, (
+        max_dimension,
+        quality
+    ) in enumerate(
+        OCR_SETTINGS,
+        start=1
+    ):
+
+        logger.info(
+            "OCR page %s: image setting %s/%s",
+            page_number,
+            setting_number,
+            len(OCR_SETTINGS)
+        )
+
+        image_buffer = None
+
+        try:
+
+            image_buffer = create_ocr_image(
+                page,
+                max_dimension,
+                quality
+            )
+
+            for retry in range(
+                OCR_429_RETRIES
+            ):
+
+                response = ocr_request(
+                    image_buffer
+                )
+
+                status = (
+                    response.status_code
+                )
+
+                logger.info(
+                    "OCR page %s HTTP %s",
+                    page_number,
+                    status
+                )
+
+                if status == 429:
+
+                    wait_seconds = min(
+                        60,
+                        5 * (
+                            2 ** retry
+                        )
+                    )
+
+                    logger.warning(
+                        "OCR 429. "
+                        "Waiting %ss",
+                        wait_seconds
+                    )
+
+                    time.sleep(
+                        wait_seconds
+                    )
+
+                    image_buffer.seek(
+                        0
+                    )
+
+                    continue
+
+                if status == 413:
+
+                    last_error = (
+                        "OCR HTTP 413"
+                    )
+
+                    break
+
+                if status != 200:
+
+                    last_error = (
+                        f"OCR HTTP {status}"
+                    )
+
+                    break
+
+                try:
+
+                    payload = (
+                        response.json()
+                    )
+
+                except Exception:
+
+                    last_error = (
+                        "OCR returned invalid JSON"
+                    )
+
+                    break
+
+                if payload.get(
+                    "IsErroredOnProcessing"
+                ):
+
+                    error_message = (
+                        payload.get(
+                            "ErrorMessage",
+                            "OCR processing error"
+                        )
+                    )
+
+                    if isinstance(
+                        error_message,
+                        list
+                    ):
+
+                        error_message = (
+                            " ".join(
+                                str(item)
+                                for item
+                                in error_message
+                            )
+                        )
+
+                    last_error = str(
+                        error_message
+                    )
+
+                    break
+
+                parsed = payload.get(
+                    "ParsedResults",
+                    []
+                )
+
+                text_parts = []
+
+                for item in parsed:
+
+                    parsed_text = (
+                        item.get(
+                            "ParsedText",
+                            ""
+                        )
+                    )
+
+                    if parsed_text:
+                        text_parts.append(
+                            parsed_text
+                        )
+
+                text = "\n".join(
+                    text_parts
+                )
+
+                text = convert_myanmar_to_unicode(
+                    text
+                )
+
+                text = clean_text(
+                    text
+                )
+
+                if text:
+
+                    return (
+                        text,
+                        None
+                    )
+
+                last_error = (
+                    "OCR returned empty text"
+                )
+
+                break
+
+        except requests.Timeout:
+
+            last_error = (
+                "OCR request timeout"
+            )
+
+        except requests.RequestException as error:
+
+            last_error = (
+                f"OCR network error: {error}"
+            )
+
+        except Exception as error:
+
+            logger.exception(
+                "OCR page error"
+            )
+
+            last_error = str(
+                error
+            )
+
+        finally:
+
+            if image_buffer:
+
+                image_buffer.close()
+
+        time.sleep(
+            OCR_REQUEST_DELAY
+        )
+
+    return (
+        "",
+        last_error
+    )
+
+
+def process_pdf_ocr(
+    pdf_path,
+    status_callback=None
+):
+
+    if not OCR_API_KEY:
+
+        return (
+            "",
+            []
+        )
+
+    document = pymupdf.open(
+        pdf_path
+    )
+
+    total_pages = len(
+        document
+    )
+
+    pages = {}
+
+    failed = []
+
+    try:
+
+        for index in range(
+            total_pages
+        ):
+
+            page_number = (
+                index + 1
+            )
+
+            if status_callback:
+
+                status_callback(
+                    page_number,
+                    total_pages
+                )
+
+            text, error = ocr_one_page(
+                document[index],
+                page_number
+            )
+
+            if text:
+
+                pages[
+                    page_number
+                ] = text
+
+            else:
+
+                pages[
+                    page_number
+                ] = (
+                    "[OCR FAILED: "
+                    f"{error}]"
+                )
+
+                failed.append(
+                    page_number
+                )
+
+    finally:
+
+        document.close()
+
+    output = []
+
+    for page_number in sorted(
+        pages
+    ):
+
+        output.append(
+            f"\n--- Page {page_number} ---\n"
+        )
+
+        output.append(
+            pages[page_number]
+        )
+
+        output.append("\n")
+
+    return (
+        "".join(output).strip(),
+        failed
+    )
+
+
+# ============================================================
+# PDF PROCESSING
+# ============================================================
+
+async def process_pdf_file(
+    update,
+    context,
+    input_path,
+    filename,
+    status_message
+):
+
+    normal_text = await asyncio.to_thread(
+        extract_pdf_text,
+        input_path
+    )
+
+    # Normal text is accepted only if it looks valid.
+    if (
+        len(normal_text) >= 100
+        and not is_text_bad(normal_text)
+    ):
+
+        document_id = save_document(
+            update.effective_user.id,
+            filename,
+            normal_text
+        )
+
+        output_path = tempfile.mktemp(
+            suffix=".txt"
+        )
+
+        try:
+
+            with open(
+                output_path,
+                "w",
+                encoding="utf-8"
+            ) as file:
+
+                file.write(
+                    normal_text
+                )
+
+            await status_message.delete()
+
+            await update.message.reply_document(
+                document=output_path,
+                caption=(
+                    "✅ PDF → Text ပြီးပါပြီ။\n\n"
+                    "📄 Normal PDF text extraction\n"
+                    "အသုံးပြုထားပါတယ်။\n\n"
+                    f"🗄️ Database ID: {document_id}"
+                )
+            )
+
+        finally:
+
+            if os.path.exists(
+                output_path
+            ):
+
+                os.remove(
+                    output_path
+                )
+
+        return
+
+    # OCR fallback
+    await status_message.edit_text(
+        "🔎 PDF Text Encoding မမှန်ပါ "
+        "သို့မဟုတ် Scanned PDF ဖြစ်နိုင်ပါတယ်။\n\n"
+        "🇲🇲 Myanmar OCR စတင်နေပါတယ်..."
+    )
+
+    document = pymupdf.open(
+        input_path
+    )
+
+    total_pages = len(
+        document
+    )
+
+    document.close()
+
+    await status_message.edit_text(
+        "🔎 PDF Text Encoding မမှန်ပါ "
+        "သို့မဟုတ် Scanned PDF ဖြစ်နိုင်ပါတယ်။\n\n"
+        "🇲🇲 Myanmar OCR စတင်နေပါတယ်...\n\n"
+        f"📄 Total pages: {total_pages}\n\n"
+        "⏳ Page တစ်မျက်နှာချင်းစီ ဖတ်နေပါတယ်။\n\n"
+        "⚠️ OCR API limit ရှိလို့ request ကို "
+        "ထိန်းပြီး ပို့ပါမယ်။"
+    )
+
+    last_update = 0
+
+    def progress(
+        page_number,
+        page_total
+    ):
+
+        nonlocal last_update
+
+        # Callback runs in worker thread.
+        # We only log here.
+        if page_number != last_update:
+
+            last_update = page_number
+
+            logger.info(
+                "OCR progress: %s/%s",
+                page_number,
+                page_total
+            )
+
+    result, failed_pages = await asyncio.to_thread(
+        process_pdf_ocr,
+        input_path,
+        progress
+    )
+
+    if not result.strip():
+
+        await status_message.edit_text(
+            "❌ OCR နဲ့ပါ စာဖတ်မရပါ။\n\n"
+            "OCR_API_KEY နဲ့ OCR service ကို စစ်ပါ။"
+        )
+
+        return
+
+    result = convert_myanmar_to_unicode(
+        result
+    )
+
+    document_id = save_document(
+        update.effective_user.id,
+        filename,
+        result
+    )
+
+    output_path = tempfile.mktemp(
+        suffix=".txt"
+    )
+
+    try:
+
+        with open(
+            output_path,
+            "w",
+            encoding="utf-8"
+        ) as file:
+
+            file.write(
+                result
+            )
+
+        await status_message.delete()
+
+        if failed_pages:
+
+            failed_text = ", ".join(
+                str(page)
+                for page in failed_pages
+            )
+
+            caption = (
+                "⚠️ PDF → Text ပြီးပါပြီ။\n\n"
+                "🇲🇲 Myanmar OCR အသုံးပြုထားပါတယ်။\n\n"
+                f"⚠️ မအောင်မြင်သော pages: "
+                f"{failed_text}\n\n"
+                f"🗄️ Database ID: {document_id}"
+            )
+
+        else:
+
+            caption = (
+                "✅ PDF → Text ပြီးပါပြီ။\n\n"
+                "🇲🇲 Myanmar OCR အသုံးပြုထားပါတယ်။\n\n"
+                f"🗄️ Database ID: {document_id}"
+            )
+
+        await update.message.reply_document(
+            document=output_path,
+            caption=caption
+        )
+
+    finally:
+
+        if os.path.exists(
+            output_path
+        ):
+
+            os.remove(
+                output_path
+            )
+
+
+# ============================================================
+# MAIN MENU
+# ============================================================
+
+def main_keyboard():
+
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "📄 PDF Tools",
+                    callback_data="menu_pdf"
+                ),
+                InlineKeyboardButton(
+                    "🤖 AI Tools",
+                    callback_data="menu_ai"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "📚 Study",
+                    callback_data="menu_study"
+                ),
+                InlineKeyboardButton(
+                    "⏰ Reminder",
+                    callback_data="menu_remind"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "ℹ️ Help",
+                    callback_data="menu_help"
+                ),
+            ],
+        ]
+    )
+
+
+# ============================================================
+# START
+# ============================================================
+
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    register_user(
+        update.effective_user
+    )
+
+    context.user_data[
+        "waiting_for_pdf"
+    ] = False
+
+    await update.message.reply_text(
+        "🤖 AI PDF Helper မှ ကြိုဆိုပါတယ်!\n\n"
+        "📄 PDF Tools\n"
+        "🤖 AI Tools\n"
+        "🔎 Database Search\n"
+        "🌤 Weather\n"
+        "💱 Exchange Rate\n"
+        "⏰ Reminder\n"
+        "📚 Study\n\n"
+        "အောက်က Menu ကနေ ရွေးပါ 👇",
+        reply_markup=main_keyboard()
+    )
+
+
+# ============================================================
+# HELP
+# ============================================================
+
+async def help_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    register_user(
+        update.effective_user
+    )
+
+    text = """
+🤖 AI PDF Helper Commands
+
+📄 PDF
+• PDF Tools → PDF → Text
+
+🤖 AI
+• စာပို့ပြီး AI ကို မေးနိုင်ပါတယ်
+
+🔎 Search
+/search keyword
+
+🌤 Weather
+/weather Yangon
+/weather Tokyo
+/weather London
+/weather New York
+
+💱 Rate
+/rate USD MMK
+/rate USD EUR
+/rate USD JPY
+/rate EUR GBP
+
+⏰ Reminder
+/remind 10m ရေသောက်ရန်
+/remind 2h စာဖတ်ရန်
+/remind 30m meeting
+/reminders
+
+📚 Study
+/Study
+/Study English
+/Study IT
+/Study Programming
+/Study Quiz
+/Study Daily
+"""
+
+    await send_long_message(
+        update,
+        text
+    )
+
+
+# ============================================================
+# PDF MENU
+# ============================================================
+
+async def pdf_menu(
+    query
+):
+
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "📄 PDF → Text",
+                    callback_data="pdf_to_text"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🔙 Main Menu",
+                    callback_data="main_menu"
+                )
+            ],
+        ]
+    )
+
+    await query.edit_message_text(
+        "📄 PDF Tools\n\n"
+        "PDF → Text ကိုရွေးပါ 👇",
+        reply_markup=keyboard
+    )
+
+
+async def ai_menu(
+    query
+):
+
+    await query.edit_message_text(
+        "🤖 AI Tools\n\n"
+        "စာကို တိုက်ရိုက်ပို့ပြီး AI ကိုမေးနိုင်ပါတယ်။\n\n"
+        "ဥပမာ:\n"
+        "Python ဆိုတာဘာလဲ?\n"
+        "ဒီစာကို အကျဉ်းချုပ်ပေးပါ။",
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "🔙 Main Menu",
+                        callback_data="main_menu"
+                    )
+                ]
+            ]
+        )
+    )
+
+
+async def study_menu(
+    query
+):
+
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "🇬🇧 English",
+                    callback_data="study_English"
+                ),
+                InlineKeyboardButton(
+                    "💻 IT",
+                    callback_data="study_IT"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "👨‍💻 Programming",
+                    callback_data="study_Programming"
+                ),
+                InlineKeyboardButton(
+                    "📝 Quiz",
+                    callback_data="study_Quiz"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "📅 Daily Lesson",
+                    callback_data="study_Daily"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🔙 Main Menu",
+                    callback_data="main_menu"
+                )
+            ],
+        ]
+    )
+
+    await query.edit_message_text(
+        "📚 STUDY CENTER\n\n"
+        "သင်ယူမယ့် Subject ကိုရွေးပါ 👇",
+        reply_markup=keyboard
+    )
+
+
+async def remind_menu(
+    query
+):
+
+    await query.edit_message_text(
+        "⏰ Reminder\n\n"
+        "ဥပမာ:\n"
+        "/remind 10m ရေသောက်ရန်\n"
+        "/remind 2h စာဖတ်ရန်\n"
+        "/remind 1d အလုပ်လုပ်ရန်\n\n"
+        "/reminders — စာရင်းကြည့်",
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "🔙 Main Menu",
+                        callback_data="main_menu"
+                    )
+                ]
+            ]
+        )
+    )
+
+
+async def button_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    query = update.callback_query
+
+    await query.answer()
+
+    if query.data == "main_menu":
+
+        await query.edit_message_text(
+            "🤖 AI PDF Helper\n\n"
+            "Main Menu 👇",
+            reply_markup=main_keyboard()
+        )
+
+        return
+
+    if query.data == "menu_pdf":
+
+        await pdf_menu(
+            query
+        )
+
+        return
+
+    if query.data == "menu_ai":
+
+        await ai_menu(
+            query
+        )
+
+        return
+
+    if query.data == "menu_study":
+
+        await study_menu(
+            query
+        )
+
+        return
+
+    if query.data == "menu_remind":
+
+        await remind_menu(
+            query
+        )
+
+        return
+
+    if query.data == "menu_help":
+
+        await query.edit_message_text(
+            "ℹ️ Help\n\n"
+            "/help ကိုသုံးပါ။",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "🔙 Main Menu",
+                            callback_data="main_menu"
+                        )
+                    ]
+                ]
+            )
+        )
+
+        return
+
+    if query.data == "pdf_to_text":
+
+        context.user_data[
+            "waiting_for_pdf"
+        ] = True
+
+        await query.edit_message_text(
+            "📄 PDF → Text\n\n"
+            "PDF ဖိုင်တစ်ခု ပို့ပါ။\n\n"
+            "Normal PDF ဖြစ်ရင် text extraction\n"
+            "လုပ်မယ်။\n\n"
+            "Myanmar encoding မမှန်ရင်\n"
+            "Zawgyi/Unicode စစ်ပြီး OCR fallback\n"
+            "လုပ်မယ်။\n\n"
+            "Scanned PDF ဆိုရင် OCR သုံးမယ်။"
+        )
+
+        return
+
+    if query.data.startswith(
+        "study_"
+    ):
+
+        subject = query.data.split(
+            "_",
+            1
+        )[1]
+
+        await send_study_lesson(
+            query,
+            context,
+            subject
+        )
+
+        return
+
+
+# ============================================================
+# WEATHER
+# ============================================================
+
+GEOCODING_URL = (
     "https://geocoding-api.open-meteo.com/v1/search"
 )
 
@@ -64,257 +1663,1588 @@ WEATHER_URL = (
     "https://api.open-meteo.com/v1/forecast"
 )
 
-RATE_URL = (
-    "https://api.frankfurter.dev/v2/rate"
-)
-
-OCR_TIMEOUT = 120
-
-HTTP_TIMEOUT = 30
-
-OCR_SETTINGS = [
-    (2200, 70),
-    (2000, 60),
-    (1800, 55),
-    (1600, 45),
-    (1400, 40),
-]
-
-OCR_429_RETRIES = 3
-
-OCR_REQUEST_DELAY = 2.0
-
-MAX_PDF_SIZE_MB = 50
-
-MAX_AI_TEXT = 12000
-
-PROCESSING_USERS = set()
-
-PROCESSING_LOCK = threading.Lock()
-
-DB_LOCK = threading.Lock()
-
-
-# ============================================================
-# CURRENCY NAMES
-# ============================================================
-
-CURRENCY_NAMES = {
-
-    "USD": "US Dollar",
-    "EUR": "Euro",
-    "GBP": "British Pound",
-    "JPY": "Japanese Yen",
-    "CNY": "Chinese Yuan",
-    "SGD": "Singapore Dollar",
-    "THB": "Thai Baht",
-    "KRW": "South Korean Won",
-    "AUD": "Australian Dollar",
-    "CAD": "Canadian Dollar",
-    "CHF": "Swiss Franc",
-    "HKD": "Hong Kong Dollar",
-    "NZD": "New Zealand Dollar",
-    "INR": "Indian Rupee",
-    "MYR": "Malaysian Ringgit",
-    "IDR": "Indonesian Rupiah",
-    "PHP": "Philippine Peso",
-    "VND": "Vietnamese Dong",
-    "AED": "UAE Dirham",
-    "SAR": "Saudi Riyal",
-    "QAR": "Qatari Riyal",
-    "TRY": "Turkish Lira",
-    "ZAR": "South African Rand",
-    "SEK": "Swedish Krona",
-    "NOK": "Norwegian Krone",
-    "DKK": "Danish Krone",
-    "PLN": "Polish Zloty",
-    "CZK": "Czech Koruna",
-    "HUF": "Hungarian Forint",
-    "MMK": "Myanmar Kyat",
-}
-
-
-# ============================================================
-# WEATHER CODES
-# ============================================================
 
 WEATHER_CODES = {
-
     0: "☀️ Clear sky",
-
-    1: "🌤️ Mainly clear",
+    1: "🌤 Mainly clear",
     2: "⛅ Partly cloudy",
     3: "☁️ Overcast",
-
-    45: "🌫️ Fog",
-    48: "🌫️ Depositing rime fog",
-
-    51: "🌦️ Light drizzle",
-    53: "🌦️ Moderate drizzle",
-    55: "🌧️ Dense drizzle",
-
-    56: "🌧️ Light freezing drizzle",
-    57: "🌧️ Dense freezing drizzle",
-
-    61: "🌧️ Slight rain",
-    63: "🌧️ Moderate rain",
-    65: "🌧️ Heavy rain",
-
-    66: "🌧️ Light freezing rain",
-    67: "🌧️ Heavy freezing rain",
-
-    71: "🌨️ Slight snow",
-    73: "🌨️ Moderate snow",
+    45: "🌫 Fog",
+    48: "🌫 Depositing rime fog",
+    51: "🌦 Light drizzle",
+    53: "🌦 Moderate drizzle",
+    55: "🌧 Dense drizzle",
+    61: "🌧 Slight rain",
+    63: "🌧 Moderate rain",
+    65: "🌧 Heavy rain",
+    71: "🌨 Slight snow",
+    73: "🌨 Moderate snow",
     75: "❄️ Heavy snow",
-
-    77: "❄️ Snow grains",
-
-    80: "🌦️ Slight rain showers",
-    81: "🌧️ Moderate rain showers",
-    82: "⛈️ Violent rain showers",
-
-    85: "🌨️ Slight snow showers",
-    86: "🌨️ Heavy snow showers",
-
-    95: "⛈️ Thunderstorm",
-    96: "⛈️ Thunderstorm with hail",
-    99: "⛈️ Thunderstorm with heavy hail",
+    80: "🌦 Rain showers",
+    81: "🌧 Rain showers",
+    82: "⛈ Violent rain showers",
+    95: "⛈ Thunderstorm",
+    96: "⛈ Thunderstorm + hail",
+    99: "⛈ Thunderstorm + hail",
 }
 
 
-# ============================================================
-# DATABASE
-# ============================================================
+def geocode_location(
+    location
+):
 
-def get_db():
-
-    conn = sqlite3.connect(
-        DB_PATH,
-        check_same_thread=False
+    response = requests.get(
+        GEOCODING_URL,
+        params={
+            "name": location,
+            "count": 5,
+            "language": "en",
+            "format": "json",
+        },
+        timeout=20
     )
 
-    conn.row_factory = sqlite3.Row
+    response.raise_for_status()
 
-    return conn
+    data = response.json()
+
+    results = data.get(
+        "results",
+        []
+    )
+
+    if not results:
+        return None
+
+    return results[0]
 
 
-def init_db():
+def get_weather(
+    latitude,
+    longitude
+):
 
-    with DB_LOCK:
+    response = requests.get(
+        WEATHER_URL,
+        params={
+            "latitude": latitude,
+            "longitude": longitude,
+            "current": (
+                "temperature_2m,"
+                "relative_humidity_2m,"
+                "apparent_temperature,"
+                "is_day,"
+                "precipitation,"
+                "weather_code,"
+                "wind_speed_10m"
+            ),
+            "timezone": "auto",
+            "forecast_days": 1,
+        },
+        timeout=20
+    )
 
-        conn = get_db()
+    response.raise_for_status()
 
-        cur = conn.cursor()
+    return response.json()
 
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS documents (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                filename TEXT NOT NULL,
-                page_count INTEGER DEFAULT 0,
-                text TEXT NOT NULL,
-                created_at TEXT NOT NULL
+
+async def weather_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    register_user(
+        update.effective_user
+    )
+
+    if not context.args:
+
+        await update.message.reply_text(
+            "🌤 Weather\n\n"
+            "အသုံးပြုပုံ:\n"
+            "/weather Yangon\n"
+            "/weather Tokyo\n"
+            "/weather London\n"
+            "/weather New York"
+        )
+
+        return
+
+    location = " ".join(
+        context.args
+    )
+
+    message = await update.message.reply_text(
+        "🌍 Location ရှာနေပါတယ်..."
+    )
+
+    try:
+
+        place = await asyncio.to_thread(
+            geocode_location,
+            location
+        )
+
+        if not place:
+
+            await message.edit_text(
+                f"❌ '{location}' ကို မတွေ့ပါ။"
             )
-        """)
 
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS reminders (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                chat_id INTEGER NOT NULL,
-                remind_at TEXT NOT NULL,
-                message TEXT NOT NULL,
-                sent INTEGER DEFAULT 0,
-                created_at TEXT NOT NULL
-            )
-        """)
+            return
 
-        cur.execute("""
-            CREATE INDEX IF NOT EXISTS idx_documents_user
-            ON documents(user_id)
-        """)
+        weather = await asyncio.to_thread(
+            get_weather,
+            place["latitude"],
+            place["longitude"]
+        )
 
-        cur.execute("""
-            CREATE INDEX IF NOT EXISTS idx_reminders_due
-            ON reminders(remind_at, sent)
-        """)
+        current = weather.get(
+            "current",
+            {}
+        )
 
-        conn.commit()
+        code = current.get(
+            "weather_code"
+        )
 
-        conn.close()
+        condition = WEATHER_CODES.get(
+            code,
+            "🌤 Unknown"
+        )
 
-    print("Database initialized.")
+        temperature = current.get(
+            "temperature_2m"
+        )
+
+        feels = current.get(
+            "apparent_temperature"
+        )
+
+        humidity = current.get(
+            "relative_humidity_2m"
+        )
+
+        wind = current.get(
+            "wind_speed_10m"
+        )
+
+        precipitation = current.get(
+            "precipitation"
+        )
+
+        name = place.get(
+            "name",
+            location
+        )
+
+        country = place.get(
+            "country",
+            ""
+        )
+
+        timezone_name = weather.get(
+            "timezone",
+            ""
+        )
+
+        text = (
+            f"🌤 Weather — {name}, {country}\n\n"
+            f"{condition}\n\n"
+            f"🌡 Temperature: {temperature}°C\n"
+            f"🌡 Feels like: {feels}°C\n"
+            f"💧 Humidity: {humidity}%\n"
+            f"💨 Wind: {wind} km/h\n"
+            f"🌧 Precipitation: {precipitation} mm\n\n"
+            f"🕐 Timezone: {timezone_name}"
+        )
+
+        await message.edit_text(
+            text
+        )
+
+    except Exception as error:
+
+        logger.exception(
+            "Weather error"
+        )
+
+        await message.edit_text(
+            "❌ Weather ရယူမရပါ။\n\n"
+            f"Error: {str(error)[:500]}"
+        )
 
 
-def save_document(
+# ============================================================
+# CURRENCY
+# ============================================================
+
+RATE_URL = (
+    "https://open.er-api.com/v6/latest/"
+)
+
+
+def get_exchange_rate(
+    base,
+    target
+):
+
+    base = base.upper()
+    target = target.upper()
+
+    response = requests.get(
+        RATE_URL + base,
+        timeout=20
+    )
+
+    response.raise_for_status()
+
+    data = response.json()
+
+    if data.get(
+        "result"
+    ) != "success":
+
+        raise RuntimeError(
+            "Exchange API error"
+        )
+
+    rates = data.get(
+        "rates",
+        {}
+    )
+
+    if target not in rates:
+
+        raise ValueError(
+            f"Currency {target} not supported"
+        )
+
+    return rates[target]
+
+
+async def rate_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    register_user(
+        update.effective_user
+    )
+
+    if len(context.args) < 2:
+
+        await update.message.reply_text(
+            "💱 အသုံးပြုပုံ:\n\n"
+            "/rate USD MMK\n"
+            "/rate USD EUR\n"
+            "/rate USD JPY\n"
+            "/rate EUR GBP\n\n"
+            "Currency code 3 လုံးသုံးပါ။"
+        )
+
+        return
+
+    base = context.args[0].upper()
+
+    target = context.args[1].upper()
+
+    message = await update.message.reply_text(
+        "💱 Exchange rate ရှာနေပါတယ်..."
+    )
+
+    try:
+
+        rate = await asyncio.to_thread(
+            get_exchange_rate,
+            base,
+            target
+        )
+
+        await message.edit_text(
+            "💱 Exchange Rate\n\n"
+            f"1 {base} = "
+            f"{rate:,.6f} {target}\n\n"
+            "⚠️ Rate သည် live market rate "
+            "အဖြစ် အတိအကျမဟုတ်နိုင်ပါ။"
+        )
+
+    except Exception as error:
+
+        await message.edit_text(
+            "❌ Exchange rate ရယူမရပါ။\n\n"
+            f"{str(error)[:500]}"
+        )
+
+
+# ============================================================
+# REMINDER
+# ============================================================
+
+REMINDER_PATTERN = re.compile(
+    r"^(\d+)\s*([smhd])$",
+    re.IGNORECASE
+)
+
+
+def parse_duration(
+    value
+):
+
+    match = REMINDER_PATTERN.match(
+        value.strip()
+    )
+
+    if not match:
+        return None
+
+    amount = int(
+        match.group(1)
+    )
+
+    unit = match.group(2).lower()
+
+    if amount <= 0:
+        return None
+
+    if unit == "s":
+        return timedelta(
+            seconds=amount
+        )
+
+    if unit == "m":
+        return timedelta(
+            minutes=amount
+        )
+
+    if unit == "h":
+        return timedelta(
+            hours=amount
+        )
+
+    if unit == "d":
+        return timedelta(
+            days=amount
+        )
+
+    return None
+
+
+def save_reminder(
     user_id,
-    filename,
-    page_count,
-    text
+    text,
+    remind_at
 ):
 
     with DB_LOCK:
 
-        conn = get_db()
+        connection = db_connect()
 
-        conn.execute(
+        cursor = connection.cursor()
+
+        cursor.execute(
             """
-            INSERT INTO documents
+            INSERT INTO reminders
             (
                 user_id,
-                filename,
-                page_count,
                 text,
+                remind_at,
                 created_at
             )
-            VALUES (?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?)
             """,
             (
                 user_id,
-                filename,
-                page_count,
                 text,
-                datetime.utcnow().isoformat()
+                remind_at,
+                now_iso()
             )
         )
 
-        conn.commit()
+        reminder_id = (
+            cursor.lastrowid
+        )
 
-        conn.close()
+        connection.commit()
+
+        connection.close()
+
+    return reminder_id
 
 
-def search_documents(
-    user_id,
-    query
+def get_reminders(
+    user_id
 ):
 
     with DB_LOCK:
 
-        conn = get_db()
+        connection = db_connect()
 
-        rows = conn.execute(
+        rows = connection.execute(
             """
             SELECT
                 id,
-                filename,
-                page_count,
                 text,
-                created_at
-            FROM documents
+                remind_at,
+                done
+            FROM reminders
             WHERE user_id = ?
-              AND text LIKE ?
-            ORDER BY id DESC
-            LIMIT 10
+              AND done = 0
+            ORDER BY remind_at ASC
             """,
             (
                 user_id,
-                "%" + query + "%"
             )
         ).fetchall()
 
-        conn.close()
+        connection.close()
 
     return rows
+
+
+def delete_reminder(
+    user_id,
+    reminder_id
+):
+
+    with DB_LOCK:
+
+        connection = db_connect()
+
+        cursor = connection.cursor()
+
+        cursor.execute(
+            """
+            DELETE FROM reminders
+            WHERE id = ?
+              AND user_id = ?
+            """,
+            (
+                reminder_id,
+                user_id
+            )
+        )
+
+        deleted = (
+            cursor.rowcount > 0
+        )
+
+        connection.commit()
+
+        connection.close()
+
+    return deleted
+
+
+def mark_reminder_done(
+    reminder_id
+):
+
+    with DB_LOCK:
+
+        connection = db_connect()
+
+        connection.execute(
+            """
+            UPDATE reminders
+            SET done = 1
+            WHERE id = ?
+            """,
+            (
+                reminder_id,
+            )
+        )
+
+        connection.commit()
+
+        connection.close()
+
+
+async def reminder_job(
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    reminder_id = (
+        context.job.data[
+            "id"
+        ]
+    )
+
+    user_id = (
+        context.job.data[
+            "user_id"
+        ]
+    )
+
+    text = (
+        context.job.data[
+            "text"
+        ]
+    )
+
+    try:
+
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=(
+                "⏰ Reminder!\n\n"
+                f"📝 {text}"
+            )
+        )
+
+    finally:
+
+        await asyncio.to_thread(
+            mark_reminder_done,
+            reminder_id
+        )
+
+
+def schedule_reminder_job(
+    application,
+    reminder_id,
+    user_id,
+    text,
+    remind_at
+):
+
+    current = datetime.now(
+        timezone.utc
+    )
+
+    delay = (
+        remind_at - current
+    ).total_seconds()
+
+    if delay < 1:
+        delay = 1
+
+    application.job_queue.run_once(
+        reminder_job,
+        when=delay,
+        data={
+            "id": reminder_id,
+            "user_id": user_id,
+            "text": text,
+        },
+        name=f"reminder_{reminder_id}"
+    )
+
+
+def restore_reminders(
+    application
+):
+
+    rows = []
+
+    with DB_LOCK:
+
+        connection = db_connect()
+
+        rows = connection.execute(
+            """
+            SELECT
+                id,
+                user_id,
+                text,
+                remind_at
+            FROM reminders
+            WHERE done = 0
+            """
+        ).fetchall()
+
+        connection.close()
+
+    for row in rows:
+
+        try:
+
+            remind_at = datetime.fromisoformat(
+                row["remind_at"]
+            )
+
+            schedule_reminder_job(
+                application,
+                row["id"],
+                row["user_id"],
+                row["text"],
+                remind_at
+            )
+
+        except Exception as error:
+
+            logger.warning(
+                "Could not restore reminder %s: %s",
+                row["id"],
+                error
+            )
+
+
+async def remind_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    register_user(
+        update.effective_user
+    )
+
+    if len(context.args) < 2:
+
+        await update.message.reply_text(
+            "⏰ Reminder အသုံးပြုပုံ:\n\n"
+            "/remind 10m ရေသောက်ရန်\n"
+            "/remind 30m စာဖတ်ရန်\n"
+            "/remind 2h meeting\n"
+            "/remind 1d အလုပ်လုပ်ရန်\n\n"
+            "/reminders — စာရင်းကြည့်\n"
+            "/delremind ID — ဖျက်"
+        )
+
+        return
+
+    duration = parse_duration(
+        context.args[0]
+    )
+
+    if not duration:
+
+        await update.message.reply_text(
+            "❌ Time format မမှန်ပါ။\n\n"
+            "10m / 30m / 2h / 1d လိုသုံးပါ။"
+        )
+
+        return
+
+    reminder_text = " ".join(
+        context.args[1:]
+    ).strip()
+
+    if not reminder_text:
+
+        await update.message.reply_text(
+            "❌ Reminder စာသားထည့်ပါ။"
+        )
+
+        return
+
+    remind_at = (
+        datetime.now(
+            timezone.utc
+        )
+        + duration
+    )
+
+    reminder_id = await asyncio.to_thread(
+        save_reminder,
+        update.effective_user.id,
+        reminder_text,
+        remind_at.isoformat()
+    )
+
+    schedule_reminder_job(
+        context.application,
+        reminder_id,
+        update.effective_user.id,
+        reminder_text,
+        remind_at
+    )
+
+    local_time = (
+        remind_at
+        .astimezone(
+            ZoneInfo(TIMEZONE)
+        )
+        .strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+    )
+
+    await update.message.reply_text(
+        "✅ Reminder ထည့်ပြီးပါပြီ။\n\n"
+        f"🆔 ID: {reminder_id}\n"
+        f"📝 {reminder_text}\n"
+        f"🕐 {local_time} ({TIMEZONE})"
+    )
+
+
+async def reminders_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    rows = await asyncio.to_thread(
+        get_reminders,
+        update.effective_user.id
+    )
+
+    if not rows:
+
+        await update.message.reply_text(
+            "⏰ လက်ရှိ Reminder မရှိပါ။"
+        )
+
+        return
+
+    lines = [
+        "⏰ Your Reminders\n"
+    ]
+
+    for row in rows:
+
+        try:
+
+            local_time = (
+                datetime.fromisoformat(
+                    row["remind_at"]
+                )
+                .astimezone(
+                    ZoneInfo(TIMEZONE)
+                )
+                .strftime(
+                    "%Y-%m-%d %H:%M"
+                )
+            )
+
+        except Exception:
+
+            local_time = row[
+                "remind_at"
+            ]
+
+        lines.append(
+            f"🆔 {row['id']} | "
+            f"{local_time}\n"
+            f"📝 {row['text']}"
+        )
+
+    lines.append(
+        "\nဖျက်ရန်: /delremind ID"
+    )
+
+    await update.message.reply_text(
+        "\n\n".join(lines)
+    )
+
+
+async def delremind_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if not context.args:
+
+        await update.message.reply_text(
+            "/delremind ID"
+        )
+
+        return
+
+    try:
+
+        reminder_id = int(
+            context.args[0]
+        )
+
+    except ValueError:
+
+        await update.message.reply_text(
+            "❌ ID မမှန်ပါ။"
+        )
+
+        return
+
+    deleted = await asyncio.to_thread(
+        delete_reminder,
+        update.effective_user.id,
+        reminder_id
+    )
+
+    if deleted:
+
+        await update.message.reply_text(
+            f"✅ Reminder {reminder_id} ဖျက်ပြီးပါပြီ။"
+        )
+
+    else:
+
+        await update.message.reply_text(
+            "❌ အဲဒီ Reminder ID မတွေ့ပါ။"
+        )
+
+
+# ============================================================
+# SEARCH
+# ============================================================
+
+async def search_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    register_user(
+        update.effective_user
+    )
+
+    if not context.args:
+
+        await update.message.reply_text(
+            "🔎 Search အသုံးပြုပုံ:\n\n"
+            "/search keyword\n\n"
+            "ဥပမာ:\n"
+            "/search နှမ်း\n"
+            "/search fertilizer"
+        )
+
+        return
+
+    keyword = " ".join(
+        context.args
+    )
+
+    rows = await asyncio.to_thread(
+        search_documents,
+        update.effective_user.id,
+        keyword
+    )
+
+    if not rows:
+
+        await update.message.reply_text(
+            f"🔎 '{keyword}' ကို Database ထဲမှာ မတွေ့ပါ။"
+        )
+
+        return
+
+    parts = [
+        f"🔎 Search results for: {keyword}\n"
+    ]
+
+    for row in rows:
+
+        content = row[
+            "content"
+        ]
+
+        position = content.lower().find(
+            keyword.lower()
+        )
+
+        if position >= 0:
+
+            start = max(
+                0,
+                position - 180
+            )
+
+            end = min(
+                len(content),
+                position + 500
+            )
+
+            snippet = content[
+                start:end
+            ]
+
+        else:
+
+            snippet = content[:500]
+
+        parts.append(
+            f"📄 {row['filename']}\n"
+            f"{snippet}\n"
+            f"🆔 DB ID: {row['id']}"
+        )
+
+    await send_long_message(
+        update,
+        "\n\n".join(parts)
+    )
+
+
+# ============================================================
+# STUDY
+# ============================================================
+
+STUDY_CONTENT = {
+
+    "English": [
+        (
+            "Lesson 1 — Basic English",
+            "Vocabulary: hello, thank you, please, sorry.\n\n"
+            "Practice:\n"
+            "1. Say hello to someone.\n"
+            "2. Make one sentence using 'please'."
+        ),
+        (
+            "Lesson 2 — Present Simple",
+            "Use the present simple for routines and facts.\n\n"
+            "Example:\n"
+            "I study English every day.\n"
+            "She works in Yangon."
+        ),
+    ],
+
+    "IT": [
+        (
+            "Lesson 1 — What is IT?",
+            "IT means Information Technology.\n\n"
+            "It includes computers, networks, software, "
+            "databases, cybersecurity and cloud systems."
+        ),
+        (
+            "Lesson 2 — Computer Basics",
+            "Learn CPU, RAM, storage, operating system, "
+            "input/output devices and networking basics."
+        ),
+    ],
+
+    "Programming": [
+        (
+            "Lesson 1 — Programming Basics",
+            "A program is a set of instructions executed "
+            "by a computer.\n\n"
+            "Learn variables, conditions, loops and functions."
+        ),
+        (
+            "Lesson 2 — Python Variables",
+            "Example:\n\n"
+            "name = 'Si Thu'\n"
+            "age = 20\n\n"
+            "A variable stores a value that your program can use."
+        ),
+    ],
+
+    "Daily": [
+        (
+            "Daily Lesson 1",
+            "Today learn one English word, one IT concept "
+            "and one programming concept.\n\n"
+            "Homework: explain each concept in your own words."
+        ),
+    ],
+
+}
+
+
+async def get_study_progress(
+    user_id
+):
+
+    with DB_LOCK:
+
+        connection = db_connect()
+
+        row = connection.execute(
+            """
+            SELECT *
+            FROM study_progress
+            WHERE user_id = ?
+            """,
+            (
+                user_id,
+            )
+        ).fetchone()
+
+        connection.close()
+
+    return row
+
+
+def set_study_progress(
+    user_id,
+    subject,
+    lesson,
+    score=0
+):
+
+    with DB_LOCK:
+
+        connection = db_connect()
+
+        connection.execute(
+            """
+            INSERT INTO study_progress
+            (
+                user_id,
+                subject,
+                lesson,
+                score,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?)
+
+            ON CONFLICT(user_id)
+            DO UPDATE SET
+                subject=excluded.subject,
+                lesson=excluded.lesson,
+                score=excluded.score,
+                updated_at=excluded.updated_at
+            """,
+            (
+                user_id,
+                subject,
+                lesson,
+                score,
+                now_iso()
+            )
+        )
+
+        connection.commit()
+
+        connection.close()
+
+
+async def send_study_lesson(
+    query,
+    context,
+    subject
+):
+
+    if subject == "Quiz":
+
+        await query.edit_message_text(
+            "📝 Quiz\n\n"
+            "Question 1:\n"
+            "Python မှာ variable တစ်ခုကို ဘယ်လိုသတ်မှတ်မလဲ?\n\n"
+            "A) var x = 10\n"
+            "B) x = 10\n"
+            "C) int x := 10\n\n"
+            "ဖြေလိုရင် A / B / C ကို ပို့ပါ။"
+        )
+
+        context.user_data[
+            "quiz_answer"
+        ] = "B"
+
+        return
+
+    lessons = STUDY_CONTENT.get(
+        subject,
+        []
+    )
+
+    if not lessons:
+
+        await query.edit_message_text(
+            "❌ ဒီ Subject မှာ Lesson မရှိသေးပါ။"
+        )
+
+        return
+
+    user_id = query.from_user.id
+
+    progress = await get_study_progress(
+        user_id
+    )
+
+    if progress and progress["subject"] == subject:
+
+        lesson_number = (
+            progress["lesson"]
+        )
+
+    else:
+
+        lesson_number = 1
+
+    index = (
+        (lesson_number - 1)
+        % len(lessons)
+    )
+
+    title, content = lessons[
+        index
+    ]
+
+    set_study_progress(
+        user_id,
+        subject,
+        lesson_number + 1,
+        progress["score"] if progress else 0
+    )
+
+    await query.edit_message_text(
+        f"📚 {subject}\n\n"
+        f"📖 {title}\n\n"
+        f"{content}\n\n"
+        "➡️ နောက် Lesson အတွက် /Study "
+        f"{subject}"
+    )
+
+
+async def study_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    register_user(
+        update.effective_user
+    )
+
+    if not context.args:
+
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "🇬🇧 English",
+                        callback_data="study_English"
+                    ),
+                    InlineKeyboardButton(
+                        "💻 IT",
+                        callback_data="study_IT"
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "👨‍💻 Programming",
+                        callback_data="study_Programming"
+                    ),
+                    InlineKeyboardButton(
+                        "📝 Quiz",
+                        callback_data="study_Quiz"
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "📅 Daily Lesson",
+                        callback_data="study_Daily"
+                    )
+                ],
+            ]
+        )
+
+        await update.message.reply_text(
+            "📚 STUDY CENTER\n\n"
+            "သင်ယူမယ့် Subject ကိုရွေးပါ 👇",
+            reply_markup=keyboard
+        )
+
+        return
+
+    requested = " ".join(
+        context.args
+    ).lower()
+
+    subject_map = {
+        "english": "English",
+        "it": "IT",
+        "programming": "Programming",
+        "program": "Programming",
+        "quiz": "Quiz",
+        "daily": "Daily",
+    }
+
+    subject = subject_map.get(
+        requested
+    )
+
+    if not subject:
+
+        await update.message.reply_text(
+            "📚 Study Subjects:\n\n"
+            "/Study English\n"
+            "/Study IT\n"
+            "/Study Programming\n"
+            "/Study Quiz\n"
+            "/Study Daily"
+        )
+
+        return
+
+    class FakeQuery:
+
+        from_user = update.effective_user
+
+        async def edit_message_text(
+            self,
+            text,
+            **kwargs
+        ):
+
+            await update.message.reply_text(
+                text,
+                **kwargs
+            )
+
+    await send_study_lesson(
+        FakeQuery(),
+        context,
+        subject
+    )
+
+
+# ============================================================
+# AI
+# ============================================================
+
+AI_SYSTEM_PROMPT = """
+You are AI PDF Helper, a helpful assistant.
+
+The user may speak Burmese or English.
+Reply in the user's language.
+
+For Burmese:
+- Use proper Unicode Myanmar.
+- Do not intentionally output Zawgyi.
+- Explain clearly and practically.
+
+You can help with:
+- English
+- IT
+- Programming
+- PDF/document questions
+- General knowledge
+- Study
+- Summaries
+- Explanations
+"""
+
+
+async def ask_ai(
+    prompt
+):
+
+    if not openai_client:
+
+        return (
+            "❌ OPENAI_API_KEY မသတ်မှတ်ထားပါ။"
+        )
+
+    try:
+
+        response = await openai_client.responses.create(
+            model=OPENAI_MODEL,
+            instructions=AI_SYSTEM_PROMPT,
+            input=prompt
+        )
+
+        output = (
+            response.output_text
+            or ""
+        ).strip()
+
+        if not output:
+
+            return (
+                "❌ AI က response မပြန်ပါ။"
+            )
+
+        return output
+
+    except Exception as error:
+
+        logger.exception(
+            "OpenAI API error"
+        )
+
+        return (
+            "❌ AI API error ဖြစ်နေပါတယ်။\n\n"
+            f"{str(error)[:1000]}"
+        )
+
+
+async def ai_message_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if not update.message:
+
+        return
+
+    text = (
+        update.message.text
+        or ""
+    ).strip()
+
+    if not text:
+
+        return
+
+    register_user(
+        update.effective_user
+    )
+
+    # Quiz answer
+    expected = context.user_data.get(
+        "quiz_answer"
+    )
+
+    if expected:
+
+        answer = text.strip().upper()
+
+        if answer == expected:
+
+            context.user_data[
+                "quiz_answer"
+            ] = None
+
+            await update.message.reply_text(
+                "✅ Correct!\n\n"
+                "B) x = 10"
+            )
+
+        else:
+
+            await update.message.reply_text(
+                "❌ မမှန်သေးပါ။\n"
+                "Hint: Python မှာ variable "
+                "ကြေညာဖို့ `=` သုံးပါတယ်။"
+            )
+
+        return
+
+    # If waiting for PDF,
+    # normal text should not be treated as AI
+    if context.user_data.get(
+        "waiting_for_pdf"
+    ):
+
+        return
+
+    await update.message.chat.send_action(
+        ChatAction.TYPING
+    )
+
+    answer = await ask_ai(
+        text
+    )
+
+    await send_long_message(
+        update,
+        answer
+    )
+
+
+# ============================================================
+# PDF DOCUMENT HANDLER
+# ============================================================
+
+async def document_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    register_user(
+        update.effective_user
+    )
+
+    document = (
+        update.message.document
+    )
+
+    if not document:
+
+        return
+
+    filename = (
+        document.file_name
+        or "document.pdf"
+    )
+
+    if not filename.lower().endswith(
+        ".pdf"
+    ):
+
+        await update.message.reply_text(
+            "❌ PDF ဖိုင်ပဲ ပို့ပေးပါ။"
+        )
+
+        return
+
+    if document.file_size:
+
+        size_mb = (
+            document.file_size
+            / 1024
+            / 1024
+        )
+
+        if size_mb > MAX_PDF_SIZE_MB:
+
+            await update.message.reply_text(
+                f"❌ PDF size {MAX_PDF_SIZE_MB}MB "
+                "ထက် မကျော်ရပါ။"
+            )
+
+            return
+
+    user_id = (
+        update.effective_user.id
+    )
+
+    with PROCESSING_LOCK:
+
+        if user_id in PROCESSING_USERS:
+
+            await update.message.reply_text(
+                "⏳ သင့် PDF ကို လုပ်နေပြီးသားပါ။"
+            )
+
+            return
+
+        PROCESSING_USERS.add(
+            user_id
+        )
+
+    status_message = None
+
+    input_path = None
+
+    try:
+
+        context.user_data[
+            "waiting_for_pdf"
+        ] = True
+
+        status_message = (
+            await update.message.reply_text(
+                "⏳ PDF ကို download လုပ်နေပါတယ်..."
+            )
+        )
+
+        telegram_file = (
+            await context.bot.get_file(
+                document.file_id
+            )
+        )
+
+        input_path = tempfile.mktemp(
+            suffix=".pdf"
+        )
+
+        await telegram_file.download_to_drive(
+            input_path
+        )
+
+        await status_message.edit_text(
+            "📄 PDF ကို စစ်နေပါတယ်..."
+        )
+
+        await process_pdf_file(
+            update,
+            context,
+            input_path,
+            filename,
+            status_message
+        )
+
+        context.user_data[
+            "waiting_for_pdf"
+        ] = False
+
+    except Exception as error:
+
+        logger.exception(
+            "PDF handler error"
+        )
+
+        if status_message:
+
+            try:
+
+                await status_message.edit_text(
+                    "❌ PDF processing မအောင်မြင်ပါ။\n\n"
+                    f"{str(error)[:1000]}"
+                )
+
+            except Exception:
+                pass
+
+    finally:
+
+        if input_path:
+
+            try:
+
+                if os.path.exists(
+                    input_path
+                ):
+
+                    os.remove(
+                        input_path
+                    )
+
+            except Exception:
+                pass
+
+        context.user_data[
+            "waiting_for_pdf"
+        ] = False
+
+        with PROCESSING_LOCK:
+
+            PROCESSING_USERS.discard(
+                user_id
+            )
+
+
+# ============================================================
+# APPLICATION STARTUP
+# ============================================================
+
+async def post_init(
+    application
+):
+
+    logger.info(
+        "AI PDF Helper starting..."
+    )
+
+    init_database()
+
+    # Remove webhook so this deployment
+    # uses polling only.
+    try:
+
+        await application.bot.delete_webhook(
+            drop_pending_updates=True
+        )
+
+        logger.info(
+            "Telegram webhook cleared."
+        )
+
+    except Exception as error:
+
+        logger.warning(
+            "Could not clear webhook: %s",
+            error
+        )
+
+    # IMPORTANT:
+    # Restore reminders only after
+    # Application is running/initialized.
+    restore_reminders(
+        application
+    )
+
+    logger.info(
+        "OCR API: %s",
+        "ENABLED"
+        if OCR_API_KEY
+        else "DISABLED"
+    )
+
+    logger.info(
+        "AI API: %s",
+        "ENABLED"
+        if OPENAI_API_KEY
+        else "DISABLED"
+    )
+
+
+async def post_shutdown(
+    application
+):
+
+    logger.info(
+        "Application shutting down..."
+    )
 
 
 # ============================================================
@@ -325,9 +3255,13 @@ class HealthHandler(
     BaseHTTPRequestHandler
 ):
 
-    def do_GET(self):
+    def do_GET(
+        self
+    ):
 
-        self.send_response(200)
+        self.send_response(
+            200
+        )
 
         self.send_header(
             "Content-Type",
@@ -337,7 +3271,7 @@ class HealthHandler(
         self.end_headers()
 
         self.wfile.write(
-            b"AI PDF Helper Bot is running"
+            b"AI PDF Helper is running"
         )
 
     def log_message(
@@ -361,2372 +3295,18 @@ def start_health_server():
             HealthHandler
         )
 
-        print(
-            f"Health server running on "
-            f"port {PORT}"
+        logger.info(
+            "Health server running on port %s",
+            PORT
         )
 
         server.serve_forever()
 
-    except Exception as e:
-
-        print(
-            "Health server error:",
-            repr(e)
-        )
-
-
-# ============================================================
-# MAIN MENU
-# ============================================================
-
-def main_keyboard():
-
-    return InlineKeyboardMarkup([
-
-        [
-            InlineKeyboardButton(
-                "📄 PDF Tools",
-                callback_data="pdf"
-            ),
-
-            InlineKeyboardButton(
-                "🤖 AI Tools",
-                callback_data="ai"
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "🌤 Weather",
-                callback_data="weather"
-            ),
-
-            InlineKeyboardButton(
-                "💱 Exchange Rate",
-                callback_data="rate"
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "🔎 Search",
-                callback_data="search"
-            ),
-
-            InlineKeyboardButton(
-                "⏰ Reminder",
-                callback_data="remind"
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "ℹ️ Help",
-                callback_data="help"
-            ),
-        ],
-
-    ])
-
-
-# ============================================================
-# START
-# ============================================================
-
-async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    context.user_data[
-        "waiting_for_pdf"
-    ] = False
-
-    await update.message.reply_text(
-
-        "🤖 AI PDF Helper\n\n"
-
-        "📄 PDF → Text / OCR\n"
-        "🤖 AI Assistant\n"
-        "🌤 Worldwide Weather\n"
-        "💱 Currency Rate\n"
-        "🔎 PDF Database Search\n"
-        "⏰ Reminder\n\n"
-
-        "အောက်က Menu ကိုရွေးပါ 👇",
-
-        reply_markup=main_keyboard()
-    )
-
-
-# ============================================================
-# HELP
-# ============================================================
-
-async def help_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    await update.message.reply_text(
-
-        "📚 AI PDF Helper Commands\n\n"
-
-        "📄 PDF\n"
-        "/start → Main Menu\n\n"
-
-        "🔎 Search\n"
-        "/search sesame\n"
-        "/search မြေဆီလွှာ\n\n"
-
-        "🌤 Weather\n"
-        "/weather Yangon\n"
-        "/weather Tokyo\n"
-        "/weather London\n"
-        "/weather New York, USA\n\n"
-
-        "💱 Rate\n"
-        "/rate USD MMK\n"
-        "/rate USD EUR\n"
-        "/rate USD JPY 100\n"
-        "/rate SGD MMK\n\n"
-
-        "⏰ Reminder\n"
-        "/remind 10m စာဖတ်ရန်\n"
-        "/remind 2h အလုပ်လုပ်ရန်\n"
-        "/remind 1d မနက်ဖြန်အလုပ်လုပ်ရန်\n"
-        "/reminders\n"
-        "/cancelremind 1\n\n"
-
-        "🤖 AI\n"
-        "/ask မြန်မာနိုင်ငံအကြောင်းရှင်းပြပါ\n\n"
-
-        "📄 PDF ပို့ပြီး PDF → Text လုပ်နိုင်ပါတယ်။"
-    )
-
-
-# ============================================================
-# BUTTON HANDLER
-# ============================================================
-
-async def button_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    if query.data == "pdf":
-
-        keyboard = InlineKeyboardMarkup([
-
-            [
-                InlineKeyboardButton(
-                    "📄 PDF → Text",
-                    callback_data="pdf_to_text"
-                )
-            ],
-
-            [
-                InlineKeyboardButton(
-                    "🔙 Back",
-                    callback_data="back"
-                )
-            ],
-
-        ])
-
-        await query.edit_message_text(
-
-            "📄 PDF Tools\n\n"
-
-            "PDF → Text ကိုရွေးပါ 👇",
-
-            reply_markup=keyboard
-        )
-
-    elif query.data == "pdf_to_text":
-
-        context.user_data[
-            "waiting_for_pdf"
-        ] = True
-
-        await query.edit_message_text(
-
-            "📄 PDF → Text\n\n"
-
-            "PDF ဖိုင်တစ်ခု ပို့ပေးပါ။\n\n"
-
-            "📄 Normal PDF\n"
-            "→ Text extraction\n\n"
-
-            "🇲🇲 Myanmar encoding "
-            "မမှန်ရင် OCR fallback\n\n"
-
-            "🖼️ Scanned PDF\n"
-            "→ OCR\n\n"
-
-            "📚 Extracted text ကို "
-            "Database ထဲသိမ်းပြီး "
-            "/search နဲ့ ပြန်ရှာနိုင်ပါတယ်။"
-        )
-
-    elif query.data == "ai":
-
-        await query.edit_message_text(
-
-            "🤖 AI Tools\n\n"
-
-            "/ask မေးခွန်း\n\n"
-
-            "ဥပမာ:\n"
-            "/ask နှမ်းစိုက်ပျိုးနည်းရှင်းပြပါ\n\n"
-
-            "OPENAI_API_KEY ထည့်ထားရင် "
-            "AI Assistant အလုပ်လုပ်ပါမယ်။"
-        )
-
-    elif query.data == "weather":
-
-        await query.edit_message_text(
-
-            "🌤 Worldwide Weather\n\n"
-
-            "မြို့နာမည်နဲ့ ရှာနိုင်ပါတယ်။\n\n"
-
-            "/weather Yangon\n"
-            "/weather Tokyo\n"
-            "/weather London\n"
-            "/weather New York\n\n"
-
-            "🌍 ကမ္ဘာတစ်ဝှမ်း location "
-            "ရှာနိုင်ပါတယ်။"
-        )
-
-    elif query.data == "rate":
-
-        await query.edit_message_text(
-
-            "💱 Exchange Rate\n\n"
-
-            "Currency code 3 လုံးသုံးပါ။\n\n"
-
-            "/rate USD MMK\n"
-            "/rate USD EUR\n"
-            "/rate USD JPY 100\n"
-            "/rate SGD MMK\n"
-            "/rate CNY MMK\n\n"
-
-            "အသုံးများတဲ့ currency တွေ "
-            "အများကြီး support လုပ်ပါတယ်။"
-        )
-
-    elif query.data == "search":
-
-        await query.edit_message_text(
-
-            "🔎 Database Search\n\n"
-
-            "/search <keyword>\n\n"
-
-            "ဥပမာ:\n"
-            "/search နှမ်း\n"
-            "/search နိုက်ထရိုဂျင်\n"
-            "/search မြေဆီလွှာ"
-        )
-
-    elif query.data == "remind":
-
-        await query.edit_message_text(
-
-            "⏰ Reminder\n\n"
-
-            "/remind 10m စာဖတ်ရန်\n"
-            "/remind 2h အလုပ်လုပ်ရန်\n"
-            "/remind 1d မနက်ဖြန်သတိပေးရန်\n\n"
-
-            "/reminders → List\n"
-            "/cancelremind ID → Cancel"
-        )
-
-    elif query.data == "help":
-
-        await query.edit_message_text(
-
-            "ℹ️ Help\n\n"
-
-            "/start\n"
-            "/search\n"
-            "/weather\n"
-            "/rate\n"
-            "/remind\n"
-            "/reminders\n"
-            "/cancelremind\n"
-            "/ask\n\n"
-
-            "PDF ပို့ရင် PDF → Text/OCR "
-            "လုပ်ပေးပါတယ်။"
-        )
-
-    elif query.data == "back":
-
-        await query.edit_message_text(
-
-            "🤖 AI PDF Helper\n\n"
-            "Main Menu 👇",
-
-            reply_markup=main_keyboard()
-        )
-
-
-# ============================================================
-# SEARCH
-# ============================================================
-
-async def search_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    user_id = update.effective_user.id
-
-    if not context.args:
-
-        await update.message.reply_text(
-
-            "🔎 Search အသုံးပြုနည်း\n\n"
-
-            "/search keyword\n\n"
-
-            "ဥပမာ:\n"
-            "/search နှမ်း\n"
-            "/search နိုက်ထရိုဂျင်"
-        )
-
-        return
-
-    query = " ".join(
-        context.args
-    ).strip()
-
-    rows = search_documents(
-        user_id,
-        query
-    )
-
-    if not rows:
-
-        await update.message.reply_text(
-
-            f"🔎 \"{query}\" ကို "
-            "သင့် Database ထဲမှာ မတွေ့ပါ။"
-        )
-
-        return
-
-    messages = [
-
-        f"🔎 Search result: "
-        f"\"{query}\"\n"
-    ]
-
-    for row in rows:
-
-        text = row["text"]
-
-        pos = text.lower().find(
-            query.lower()
-        )
-
-        if pos < 0:
-
-            snippet = text[:500]
-
-        else:
-
-            start = max(
-                0,
-                pos - 150
-            )
-
-            end = min(
-                len(text),
-                pos + 500
-            )
-
-            snippet = text[
-                start:end
-            ]
-
-        messages.append(
-
-            "\n📄 "
-            f"{row['filename']}\n"
-            f"📑 Pages: {row['page_count']}\n"
-            f"📝 {snippet}\n"
-        )
-
-    result = "\n".join(
-        messages
-    )
-
-    # Telegram message limit safety
-    if len(result) > 3900:
-
-        result = result[:3900]
-
-        result += "\n\n... ဆက်လက်ရှိပါသည်။"
-
-    await update.message.reply_text(
-        result
-    )
-
-
-# ============================================================
-# WEATHER
-# ============================================================
-
-def get_weather(
-    location
-):
-
-    geo_response = requests.get(
-        WEATHER_GEO_URL,
-        params={
-            "name": location,
-            "count": 1,
-            "language": "en",
-            "format": "json",
-        },
-        timeout=HTTP_TIMEOUT
-    )
-
-    geo_response.raise_for_status()
-
-    geo_data = geo_response.json()
-
-    results = geo_data.get(
-        "results",
-        []
-    )
-
-    if not results:
-
-        return None
-
-    place = results[0]
-
-    latitude = place["latitude"]
-    longitude = place["longitude"]
-
-    weather_response = requests.get(
-        WEATHER_URL,
-        params={
-            "latitude": latitude,
-            "longitude": longitude,
-
-            "current": (
-                "temperature_2m,"
-                "relative_humidity_2m,"
-                "apparent_temperature,"
-                "is_day,"
-                "precipitation,"
-                "weather_code,"
-                "wind_speed_10m"
-            ),
-
-            "daily": (
-                "weather_code,"
-                "temperature_2m_max,"
-                "temperature_2m_min,"
-                "precipitation_probability_max"
-            ),
-
-            "forecast_days": 3,
-
-            "timezone": "auto",
-        },
-        timeout=HTTP_TIMEOUT
-    )
-
-    weather_response.raise_for_status()
-
-    weather = weather_response.json()
-
-    return (
-        place,
-        weather
-    )
-
-
-async def weather_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    if not context.args:
-
-        await update.message.reply_text(
-
-            "🌤 Weather အသုံးပြုနည်း\n\n"
-
-            "/weather Yangon\n"
-            "/weather Tokyo\n"
-            "/weather London\n"
-            "/weather New York\n"
-            "/weather Bangkok, Thailand"
-        )
-
-        return
-
-    location = " ".join(
-        context.args
-    )
-
-    msg = await update.message.reply_text(
-        "🌍 Location ရှာနေပါတယ်..."
-    )
-
-    try:
-
-        result = await asyncio.to_thread(
-            get_weather,
-            location
-        )
-
-        if not result:
-
-            await msg.edit_text(
-
-                f"❌ \"{location}\" ကို "
-                "မတွေ့ပါ။\n\n"
-
-                "မြို့နာမည် + နိုင်ငံနာမည် "
-                "ထည့်ကြည့်ပါ။"
-            )
-
-            return
-
-        place, weather = result
-
-        current = weather.get(
-            "current",
-            {}
-        )
-
-        daily = weather.get(
-            "daily",
-            {}
-        )
-
-        code = current.get(
-            "weather_code"
-        )
-
-        description = WEATHER_CODES.get(
-            code,
-            "🌤️ Unknown"
-        )
-
-        name = place.get(
-            "name",
-            location
-        )
-
-        country = place.get(
-            "country",
-            ""
-        )
-
-        temp = current.get(
-            "temperature_2m"
-        )
-
-        feels = current.get(
-            "apparent_temperature"
-        )
-
-        humidity = current.get(
-            "relative_humidity_2m"
-        )
-
-        wind = current.get(
-            "wind_speed_10m"
-        )
-
-        precipitation = current.get(
-            "precipitation"
-        )
-
-        lines = [
-
-            f"🌤️ Weather — {name}",
-
-            f"🌍 {country}",
-
-            "",
-
-            f"{description}",
-
-            f"🌡 Temperature: {temp}°C",
-
-            f"🥵 Feels like: {feels}°C",
-
-            f"💧 Humidity: {humidity}%",
-
-            f"💨 Wind: {wind} km/h",
-
-            f"🌧 Precipitation: {precipitation} mm",
-
-            "",
-
-            "📅 3-Day Forecast:",
-        ]
-
-        dates = daily.get(
-            "time",
-            []
-        )
-
-        maxs = daily.get(
-            "temperature_2m_max",
-            []
-        )
-
-        mins = daily.get(
-            "temperature_2m_min",
-            []
-        )
-
-        probs = daily.get(
-            "precipitation_probability_max",
-            []
-        )
-
-        codes = daily.get(
-            "weather_code",
-            []
-        )
-
-        for i in range(
-            min(
-                3,
-                len(dates)
-            )
-        ):
-
-            dcode = codes[i]
-
-            ddesc = WEATHER_CODES.get(
-                dcode,
-                "🌤️"
-            )
-
-            lines.append(
-
-                f"{dates[i]} "
-                f"{ddesc} "
-                f"{mins[i]}–{maxs[i]}°C "
-                f"🌧 {probs[i]}%"
-            )
-
-        await msg.edit_text(
-            "\n".join(lines)
-        )
-
-    except Exception as e:
-
-        print(
-            "Weather error:",
-            repr(e)
-        )
-
-        await msg.edit_text(
-
-            "❌ Weather ရှာမရပါ။\n\n"
-            "Location ကို "
-            "မြို့ + နိုင်ငံပုံစံနဲ့ "
-            "ပြန်စမ်းပါ။"
-        )
-
-
-# ============================================================
-# CURRENCY
-# ============================================================
-
-def normalize_currency(
-    code
-):
-
-    return code.strip().upper()
-
-
-def format_decimal(
-    value
-):
-
-    try:
-
-        d = Decimal(str(value))
-
-        if abs(d) >= 1000:
-
-            return f"{d:,.2f}"
-
-        if abs(d) >= 1:
-
-            return f"{d:,.4f}"
-
-        return f"{d:.8f}".rstrip(
-            "0"
-        ).rstrip(".")
-
-    except Exception:
-
-        return str(value)
-
-
-def get_rate(
-    base,
-    quote
-):
-
-    response = requests.get(
-
-        f"{RATE_URL}/"
-        f"{base}/"
-        f"{quote}",
-
-        timeout=HTTP_TIMEOUT
-    )
-
-    if response.status_code != 200:
-
-        try:
-
-            data = response.json()
-
-        except Exception:
-
-            data = {}
-
-        message = data.get(
-            "message",
-            "Rate unavailable"
-        )
-
-        raise ValueError(
-            message
-        )
-
-    return response.json()
-
-
-async def rate_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    if len(context.args) < 2:
-
-        await update.message.reply_text(
-
-            "💱 Rate အသုံးပြုနည်း\n\n"
-
-            "/rate USD MMK\n"
-            "/rate USD EUR\n"
-            "/rate USD JPY 100\n"
-            "/rate SGD MMK\n\n"
-
-            "Currency code 3 လုံးသုံးပါ။\n\n"
-
-            "ဥပမာ:\n"
-            "USD = US Dollar\n"
-            "EUR = Euro\n"
-            "GBP = British Pound\n"
-            "JPY = Japanese Yen\n"
-            "CNY = Chinese Yuan\n"
-            "SGD = Singapore Dollar\n"
-            "THB = Thai Baht\n"
-            "KRW = Korean Won\n"
-            "MMK = Myanmar Kyat"
-        )
-
-        return
-
-    base = normalize_currency(
-        context.args[0]
-    )
-
-    quote = normalize_currency(
-        context.args[1]
-    )
-
-    amount = Decimal("1")
-
-    if len(context.args) >= 3:
-
-        try:
-
-            amount = Decimal(
-                context.args[2]
-            )
-
-            if amount <= 0:
-
-                raise ValueError
-
-        except Exception:
-
-            await update.message.reply_text(
-                "❌ Amount မမှန်ပါ။"
-            )
-
-            return
-
-    if len(base) != 3 or len(quote) != 3:
-
-        await update.message.reply_text(
-
-            "❌ Currency code ကို "
-            "3 လုံးသုံးပါ။\n\n"
-
-            "ဥပမာ: USD MMK"
-        )
-
-        return
-
-    msg = await update.message.reply_text(
-        "💱 Exchange rate ရှာနေပါတယ်..."
-    )
-
-    try:
-
-        data = await asyncio.to_thread(
-
-            get_rate,
-            base,
-            quote
-        )
-
-        rate = Decimal(
-            str(data["rate"])
-        )
-
-        converted = (
-            amount * rate
-        )
-
-        base_name = CURRENCY_NAMES.get(
-            base,
-            base
-        )
-
-        quote_name = CURRENCY_NAMES.get(
-            quote,
-            quote
-        )
-
-        date = data.get(
-            "date",
-            "N/A"
-        )
-
-        await msg.edit_text(
-
-            "💱 Exchange Rate\n\n"
-
-            f"💵 {base} — {base_name}\n"
-            f"💴 {quote} — {quote_name}\n\n"
-
-            f"1 {base} = "
-            f"{format_decimal(rate)} "
-            f"{quote}\n\n"
-
-            f"{format_decimal(amount)} "
-            f"{base} = "
-            f"{format_decimal(converted)} "
-            f"{quote}\n\n"
-
-            f"📅 Rate date: {date}\n"
-
-            "ℹ️ Market/cash rate မဟုတ်နိုင်ပါ။ "
-            "Reference rate အဖြစ်သုံးပါ။"
-        )
-
-    except Exception as e:
-
-        print(
-            "Rate error:",
-            repr(e)
-        )
-
-        await msg.edit_text(
-
-            "❌ ဒီ currency pair ကို "
-            "rate source မှာ မတွေ့ပါ။\n\n"
-
-            "ဥပမာ:\n"
-            "/rate USD EUR\n"
-            "/rate USD MMK\n"
-            "/rate SGD MMK"
-        )
-
-
-# ============================================================
-# REMINDER
-# ============================================================
-
-DURATION_RE = re.compile(
-    r"^(\d+(?:\.\d+)?)([smhd])$",
-    re.IGNORECASE
-)
-
-
-def parse_duration(
-    value
-):
-
-    match = DURATION_RE.match(
-        value.strip()
-    )
-
-    if not match:
-
-        return None
-
-    number = float(
-        match.group(1)
-    )
-
-    unit = match.group(2).lower()
-
-    if unit == "s":
-
-        return timedelta(
-            seconds=number
-        )
-
-    if unit == "m":
-
-        return timedelta(
-            minutes=number
-        )
-
-    if unit == "h":
-
-        return timedelta(
-            hours=number
-        )
-
-    if unit == "d":
-
-        return timedelta(
-            days=number
-        )
-
-    return None
-
-
-def save_reminder(
-    user_id,
-    chat_id,
-    remind_at,
-    message
-):
-
-    with DB_LOCK:
-
-        conn = get_db()
-
-        cur = conn.execute(
-
-            """
-            INSERT INTO reminders
-            (
-                user_id,
-                chat_id,
-                remind_at,
-                message,
-                created_at
-            )
-            VALUES (?, ?, ?, ?, ?)
-            """,
-
-            (
-                user_id,
-                chat_id,
-                remind_at.isoformat(),
-                message,
-                datetime.utcnow().isoformat()
-            )
-        )
-
-        reminder_id = cur.lastrowid
-
-        conn.commit()
-
-        conn.close()
-
-    return reminder_id
-
-
-async def remind_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    if len(context.args) < 2:
-
-        await update.message.reply_text(
-
-            "⏰ Reminder အသုံးပြုနည်း\n\n"
-
-            "/remind 10m စာဖတ်ရန်\n"
-            "/remind 2h အလုပ်လုပ်ရန်\n"
-            "/remind 1d မနက်ဖြန်လုပ်ရန်\n\n"
-
-            "ယူနစ်:\n"
-            "s = seconds\n"
-            "m = minutes\n"
-            "h = hours\n"
-            "d = days"
-        )
-
-        return
-
-    duration = parse_duration(
-        context.args[0]
-    )
-
-    if duration is None:
-
-        await update.message.reply_text(
-
-            "❌ Time format မမှန်ပါ။\n\n"
-
-            "ဥပမာ:\n"
-            "10m\n"
-            "2h\n"
-            "1d"
-        )
-
-        return
-
-    message = " ".join(
-        context.args[1:]
-    ).strip()
-
-    if not message:
-
-        await update.message.reply_text(
-            "❌ Reminder စာသားထည့်ပါ။"
-        )
-
-        return
-
-    remind_at = (
-        datetime.now()
-        + duration
-    )
-
-    reminder_id = save_reminder(
-
-        update.effective_user.id,
-
-        update.effective_chat.id,
-
-        remind_at,
-
-        message
-    )
-
-    await update.message.reply_text(
-
-        "✅ Reminder တင်ပြီးပါပြီ။\n\n"
-
-        f"🆔 ID: {reminder_id}\n"
-        f"⏰ {remind_at.strftime('%Y-%m-%d %H:%M:%S')}\n"
-        f"📝 {message}"
-    )
-
-
-async def reminders_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    user_id = update.effective_user.id
-
-    with DB_LOCK:
-
-        conn = get_db()
-
-        rows = conn.execute(
-
-            """
-            SELECT
-                id,
-                remind_at,
-                message
-            FROM reminders
-            WHERE user_id = ?
-              AND sent = 0
-            ORDER BY remind_at
-            LIMIT 20
-            """,
-
-            (user_id,)
-        ).fetchall()
-
-        conn.close()
-
-    if not rows:
-
-        await update.message.reply_text(
-            "⏰ Active reminder မရှိပါ။"
-        )
-
-        return
-
-    lines = [
-        "⏰ Active Reminders\n"
-    ]
-
-    for row in rows:
-
-        lines.append(
-
-            f"🆔 {row['id']}\n"
-            f"⏰ {row['remind_at']}\n"
-            f"📝 {row['message']}\n"
-        )
-
-    await update.message.reply_text(
-        "\n".join(lines)
-    )
-
-
-async def cancel_remind_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    if not context.args:
-
-        await update.message.reply_text(
-
-            "/cancelremind ID\n\n"
-
-            "ဥပမာ:\n"
-            "/cancelremind 3"
-        )
-
-        return
-
-    try:
-
-        reminder_id = int(
-            context.args[0]
-        )
-
-    except Exception:
-
-        await update.message.reply_text(
-            "❌ Reminder ID မမှန်ပါ။"
-        )
-
-        return
-
-    with DB_LOCK:
-
-        conn = get_db()
-
-        cur = conn.execute(
-
-            """
-            UPDATE reminders
-            SET sent = 1
-            WHERE id = ?
-              AND user_id = ?
-              AND sent = 0
-            """,
-
-            (
-                reminder_id,
-                update.effective_user.id
-            )
-        )
-
-        conn.commit()
-
-        changed = cur.rowcount
-
-        conn.close()
-
-    if changed:
-
-        await update.message.reply_text(
-            "✅ Reminder cancel လုပ်ပြီးပါပြီ။"
-        )
-
-    else:
-
-        await update.message.reply_text(
-            "❌ Reminder မတွေ့ပါ။"
-        )
-
-
-async def reminder_worker(
-    application
-):
-
-    while True:
-
-        try:
-
-            now = datetime.now()
-
-            with DB_LOCK:
-
-                conn = get_db()
-
-                rows = conn.execute(
-
-                    """
-                    SELECT
-                        id,
-                        chat_id,
-                        message
-                    FROM reminders
-                    WHERE sent = 0
-                      AND remind_at <= ?
-                    ORDER BY remind_at
-                    LIMIT 50
-                    """,
-
-                    (now.isoformat(),)
-                ).fetchall()
-
-                for row in rows:
-
-                    try:
-
-                        await application.bot.send_message(
-
-                            chat_id=row["chat_id"],
-
-                            text=(
-                                "⏰ Reminder\n\n"
-                                f"📝 {row['message']}"
-                            )
-                        )
-
-                        conn.execute(
-
-                            """
-                            UPDATE reminders
-                            SET sent = 1
-                            WHERE id = ?
-                            """,
-
-                            (row["id"],)
-                        )
-
-                    except Exception as e:
-
-                        print(
-                            "Reminder send error:",
-                            repr(e)
-                        )
-
-                conn.commit()
-
-                conn.close()
-
-        except Exception as e:
-
-            print(
-                "Reminder worker error:",
-                repr(e)
-            )
-
-        await asyncio.sleep(10)
-
-
-# ============================================================
-# MYANMAR TEXT QUALITY
-# ============================================================
-
-def count_myanmar_chars(
-    text
-):
-
-    return sum(
-
-        1
-        for ch in text
-
-        if 0x1000 <= ord(ch) <= 0x109F
-    )
-
-
-def suspicious_myanmar_score(
-    text
-):
-
-    patterns = [
-
-        "ေြ",
-        "ြေ",
-        "်ေ",
-        "ေျ",
-        "ြ်",
-        "ဴ",
-        "ဵ",
-    ]
-
-    return sum(
-        text.count(p)
-        for p in patterns
-    )
-
-
-def is_myanmar_text_bad(
-    text
-):
-
-    if not text:
-
-        return True
-
-    stripped = text.strip()
-
-    if len(stripped) < 100:
-
-        return True
-
-    myanmar = count_myanmar_chars(
-        stripped
-    )
-
-    suspicious = suspicious_myanmar_score(
-        stripped
-    )
-
-    print(
-        "Myanmar chars:",
-        myanmar,
-        "Suspicious:",
-        suspicious
-    )
-
-    if myanmar >= 20 and suspicious >= 8:
-
-        return True
-
-    if myanmar == 0 and len(stripped) > 200:
-
-        return True
-
-    return False
-
-
-# ============================================================
-# NORMAL PDF EXTRACTION
-# ============================================================
-
-def extract_pdf_text(
-    pdf_path
-):
-
-    try:
-
-        reader = PdfReader(
-            pdf_path
-        )
-
-        parts = []
-
-        for index, page in enumerate(
-            reader.pages,
-            start=1
-        ):
-
-            print(
-                f"Extracting page "
-                f"{index}"
-            )
-
-            try:
-
-                text = page.extract_text()
-
-                if text:
-
-                    parts.append(text)
-
-            except Exception as e:
-
-                print(
-                    "Page extraction error:",
-                    repr(e)
-                )
-
-        return "\n".join(
-            parts
-        ).strip()
-
-    except Exception as e:
-
-        print(
-            "PDF extraction error:",
-            repr(e)
-        )
-
-        return ""
-
-
-# ============================================================
-# OCR IMAGE
-# ============================================================
-
-def create_ocr_image(
-    page,
-    max_dimension,
-    quality
-):
-
-    pix = page.get_pixmap(
-        matrix=fitz.Matrix(
-            2,
-            2
-        ),
-        alpha=False
-    )
-
-    image = Image.frombytes(
-
-        "RGB",
-
-        (
-            pix.width,
-            pix.height
-        ),
-
-        pix.samples
-    )
-
-    width, height = image.size
-
-    largest = max(
-        width,
-        height
-    )
-
-    if largest > max_dimension:
-
-        scale = (
-            max_dimension
-            /
-            largest
-        )
-
-        image = image.resize(
-
-            (
-                int(width * scale),
-                int(height * scale)
-            ),
-
-            Image.Resampling.LANCZOS
-        )
-
-    buffer = io.BytesIO()
-
-    image.save(
-
-        buffer,
-
-        format="JPEG",
-
-        quality=quality,
-
-        optimize=True
-    )
-
-    buffer.seek(0)
-
-    return buffer
-
-
-# ============================================================
-# OCR REQUEST
-# ============================================================
-
-def send_ocr_request(
-    image_buffer
-):
-
-    image_buffer.seek(0)
-
-    response = requests.post(
-
-        OCR_URL,
-
-        headers={
-            "apikey": OCR_API_KEY
-        },
-
-        files={
-            "file": (
-                "page.jpg",
-                image_buffer,
-                "image/jpeg"
-            )
-        },
-
-        data={
-
-            # OCR.space language code
-            # may not provide Burmese in
-            # every engine/account.
-            #
-            # Engine 3 supports auto detection.
-            "language": "auto",
-
-            "OCREngine": "3",
-
-            "isOverlayRequired": "false",
-
-            "detectOrientation": "true",
-
-            "scale": "true",
-        },
-
-        timeout=OCR_TIMEOUT
-    )
-
-    return response
-
-
-# ============================================================
-# OCR ONE PAGE
-# ============================================================
-
-def ocr_page(
-    page,
-    page_number
-):
-
-    if not OCR_API_KEY:
-
-        return (
-            "",
-            "OCR_API_KEY မတွေ့ပါ"
-        )
-
-    last_error = (
-        "Unknown OCR error"
-    )
-
-    for (
-        max_dimension,
-        quality
-    ) in OCR_SETTINGS:
-
-        print(
-
-            f"OCR page "
-            f"{page_number} "
-            f"size={max_dimension} "
-            f"quality={quality}"
-        )
-
-        try:
-
-            image_buffer = (
-                create_ocr_image(
-
-                    page,
-
-                    max_dimension,
-
-                    quality
-                )
-            )
-
-            for retry in range(
-                OCR_429_RETRIES + 1
-            ):
-
-                response = (
-                    send_ocr_request(
-                        image_buffer
-                    )
-                )
-
-                print(
-
-                    f"Page "
-                    f"{page_number}: "
-                    f"HTTP "
-                    f"{response.status_code}"
-                )
-
-                if response.status_code == 429:
-
-                    if retry >= OCR_429_RETRIES:
-
-                        last_error = (
-                            "OCR API HTTP 429"
-                        )
-
-                        break
-
-                    wait = (
-                        10
-                        *
-                        (retry + 1)
-                    )
-
-                    print(
-                        f"429 → "
-                        f"wait {wait}s"
-                    )
-
-                    time.sleep(
-                        wait
-                    )
-
-                    continue
-
-                if response.status_code == 413:
-
-                    last_error = (
-                        "OCR API HTTP 413"
-                    )
-
-                    break
-
-                if response.status_code != 200:
-
-                    last_error = (
-
-                        "OCR API HTTP "
-                        f"{response.status_code}"
-                    )
-
-                    break
-
-                try:
-
-                    result = response.json()
-
-                except Exception:
-
-                    last_error = (
-                        "Invalid OCR JSON"
-                    )
-
-                    break
-
-                if result.get(
-                    "IsErroredOnProcessing"
-                ):
-
-                    message = result.get(
-
-                        "ErrorMessage",
-
-                        "OCR processing error"
-                    )
-
-                    if isinstance(
-                        message,
-                        list
-                    ):
-
-                        message = " ".join(
-                            str(x)
-                            for x in message
-                        )
-
-                    last_error = str(
-                        message
-                    )
-
-                    break
-
-                parsed = result.get(
-                    "ParsedResults",
-                    []
-                )
-
-                parts = []
-
-                for item in parsed:
-
-                    text = item.get(
-                        "ParsedText",
-                        ""
-                    )
-
-                    if text:
-
-                        parts.append(
-                            text
-                        )
-
-                text = "\n".join(
-                    parts
-                ).strip()
-
-                if text:
-
-                    return (
-                        text,
-                        None
-                    )
-
-                last_error = (
-                    "OCR returned empty text"
-                )
-
-                break
-
-            time.sleep(
-                OCR_REQUEST_DELAY
-            )
-
-        except requests.Timeout:
-
-            last_error = (
-                "OCR timeout"
-            )
-
-        except requests.RequestException as e:
-
-            last_error = (
-                f"OCR network error: {e}"
-            )
-
-        except Exception as e:
-
-            last_error = str(e)
-
-        time.sleep(
-            OCR_REQUEST_DELAY
-        )
-
-    return (
-        "",
-        last_error
-    )
-
-
-# ============================================================
-# OCR PDF
-# ============================================================
-
-def process_pdf_ocr(
-    pdf_path
-):
-
-    pdf = fitz.open(
-        pdf_path
-    )
-
-    pages = {}
-
-    failed = []
-
-    try:
-
-        total = len(pdf)
-
-        for index in range(total):
-
-            page_number = index + 1
-
-            print(
-                f"OCR page "
-                f"{page_number}/"
-                f"{total}"
-            )
-
-            text, error = ocr_page(
-
-                pdf[index],
-
-                page_number
-            )
-
-            if text:
-
-                pages[
-                    page_number
-                ] = text
-
-            else:
-
-                pages[
-                    page_number
-                ] = "[OCR FAILED]"
-
-                failed.append(
-                    page_number
-                )
-
-                print(
-                    f"OCR failed "
-                    f"page {page_number}: "
-                    f"{error}"
-                )
-
-    finally:
-
-        pdf.close()
-
-    output = []
-
-    for number in sorted(
-        pages.keys()
-    ):
-
-        output.append(
-
-            f"\n--- Page "
-            f"{number} ---\n"
-        )
-
-        output.append(
-            pages[number]
-        )
-
-    result = "\n".join(
-        output
-    ).strip()
-
-    return (
-        result,
-        failed
-    )
-
-
-# ============================================================
-# PDF HANDLER
-# ============================================================
-
-async def handle_pdf(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    if not context.user_data.get(
-        "waiting_for_pdf"
-    ):
-
-        return
-
-    user_id = update.effective_user.id
-
-    with PROCESSING_LOCK:
-
-        if user_id in PROCESSING_USERS:
-
-            await update.message.reply_text(
-
-                "⏳ သင့် PDF ကို "
-                "လုပ်နေပြီးသားပါ။"
-            )
-
-            return
-
-        PROCESSING_USERS.add(
-            user_id
-        )
-
-    document = update.message.document
-
-    if not document:
-
-        with PROCESSING_LOCK:
-
-            PROCESSING_USERS.discard(
-                user_id
-            )
-
-        return
-
-    filename = (
-        document.file_name
-        or "document.pdf"
-    )
-
-    if not filename.lower().endswith(
-        ".pdf"
-    ):
-
-        with PROCESSING_LOCK:
-
-            PROCESSING_USERS.discard(
-                user_id
-            )
-
-        await update.message.reply_text(
-            "❌ PDF ဖိုင်ပဲ ပို့ပါ။"
-        )
-
-        return
-
-    file_size = (
-        document.file_size
-        or 0
-    )
-
-    if file_size > (
-        MAX_PDF_SIZE_MB
-        * 1024
-        * 1024
-    ):
-
-        with PROCESSING_LOCK:
-
-            PROCESSING_USERS.discard(
-                user_id
-            )
-
-        await update.message.reply_text(
-
-            f"❌ PDF size က "
-            f"{MAX_PDF_SIZE_MB} MB "
-            "ထက်ကြီးနေပါတယ်။"
-        )
-
-        return
-
-    status = await update.message.reply_text(
-        "⏳ PDF download လုပ်နေပါတယ်..."
-    )
-
-    input_path = None
-    output_path = None
-
-    try:
-
-        telegram_file = (
-            await context.bot.get_file(
-                document.file_id
-            )
-        )
-
-        input_path = tempfile.mktemp(
-            suffix=".pdf"
-        )
-
-        await telegram_file.download_to_drive(
-            input_path
-        )
-
-        await status.edit_text(
-
-            "📄 PDF text extraction "
-            "စစ်နေပါတယ်..."
-        )
-
-        normal_text = await asyncio.to_thread(
-
-            extract_pdf_text,
-
-            input_path
-        )
-
-        bad = is_myanmar_text_bad(
-            normal_text
-        )
-
-        # ----------------------------------------------------
-        # NORMAL TEXT ACCEPT
-        # ----------------------------------------------------
-
-        if (
-            len(normal_text.strip()) >= 100
-            and not bad
-        ):
-
-            pdf = fitz.open(
-                input_path
-            )
-
-            page_count = len(pdf)
-
-            pdf.close()
-
-            save_document(
-
-                user_id,
-
-                filename,
-
-                page_count,
-
-                normal_text
-            )
-
-            output_path = tempfile.mktemp(
-                suffix=".txt"
-            )
-
-            with open(
-                output_path,
-                "w",
-                encoding="utf-8"
-            ) as f:
-
-                f.write(
-                    normal_text
-                )
-
-            await status.delete()
-
-            await update.message.reply_document(
-
-                document=output_path,
-
-                caption=(
-
-                    "✅ PDF → Text ပြီးပါပြီ။\n\n"
-
-                    "📄 Normal PDF extraction\n"
-
-                    "📚 Database ထဲလည်း "
-                    "သိမ်းပြီးပါပြီ။\n\n"
-
-                    "🔎 /search keyword "
-                    "နဲ့ ပြန်ရှာနိုင်ပါတယ်။"
-                )
-            )
-
-            context.user_data[
-                "waiting_for_pdf"
-            ] = False
-
-            return
-
-        # ----------------------------------------------------
-        # OCR
-        # ----------------------------------------------------
-
-        if not OCR_API_KEY:
-
-            await status.edit_text(
-
-                "❌ Normal PDF text က "
-                "Myanmar encoding မမှန်ပါ။\n\n"
-
-                "OCR_API_KEY မရှိလို့ "
-                "OCR fallback မလုပ်နိုင်ပါ။"
-            )
-
-            return
-
-        pdf = fitz.open(
-            input_path
-        )
-
-        total_pages = len(pdf)
-
-        pdf.close()
-
-        await status.edit_text(
-
-            "🔎 PDF Text Encoding "
-            "မမှန်ပါ သို့မဟုတ် "
-            "Scanned PDF ဖြစ်နိုင်ပါတယ်။\n\n"
-
-            "🇲🇲 Myanmar OCR စတင်နေပါတယ်...\n\n"
-
-            f"📄 Total pages: "
-            f"{total_pages}\n\n"
-
-            "⏳ Page တစ်မျက်နှာချင်းစီ "
-            "ဖတ်နေပါတယ်။\n\n"
-
-            "⚠️ OCR API limit ရှိလို့ "
-            "request ကို ထိန်းပြီး ပို့ပါမယ်။"
-        )
-
-        result, failed = await asyncio.to_thread(
-
-            process_pdf_ocr,
-
-            input_path
-        )
-
-        if not result.strip():
-
-            await status.edit_text(
-
-                "❌ OCR နဲ့ စာဖတ်မရပါ။"
-            )
-
-            return
-
-        save_document(
-
-            user_id,
-
-            filename,
-
-            total_pages,
-
-            result
-        )
-
-        output_path = tempfile.mktemp(
-            suffix=".txt"
-        )
-
-        with open(
-            output_path,
-            "w",
-            encoding="utf-8"
-        ) as f:
-
-            f.write(
-                result
-            )
-
-        if failed:
-
-            failed_text = ", ".join(
-                map(str, failed)
-            )
-
-            caption = (
-
-                "⚠️ PDF → Text ပြီးပါပြီ။\n\n"
-
-                "🇲🇲 OCR အသုံးပြုထားပါတယ်။\n\n"
-
-                f"⚠️ မအောင်မြင်တဲ့ page: "
-                f"{failed_text}\n\n"
-
-                "📚 Database ထဲ သိမ်းထားပါတယ်။"
-            )
-
-        else:
-
-            caption = (
-
-                "✅ PDF → Text ပြီးပါပြီ။\n\n"
-
-                "🇲🇲 OCR အသုံးပြုထားပါတယ်။\n\n"
-
-                "📚 Database ထဲ သိမ်းထားပါတယ်။\n"
-
-                "🔎 /search keyword နဲ့ "
-                "ပြန်ရှာနိုင်ပါတယ်။"
-            )
-
-        try:
-
-            await status.delete()
-
-        except Exception:
-
-            pass
-
-        await update.message.reply_document(
-
-            document=output_path,
-
-            caption=caption
-        )
-
-        context.user_data[
-            "waiting_for_pdf"
-        ] = False
-
-    except Exception as e:
-
-        print(
-            "PDF error:",
-            repr(e)
-        )
-
-        try:
-
-            await status.edit_text(
-
-                "❌ PDF processing "
-                "မအောင်မြင်ပါ။\n\n"
-
-                f"{str(e)[:1000]}"
-            )
-
-        except Exception:
-
-            pass
-
-    finally:
-
-        if (
-            input_path
-            and os.path.exists(
-                input_path
-            )
-        ):
-
-            try:
-
-                os.remove(
-                    input_path
-                )
-
-            except Exception:
-
-                pass
-
-        if (
-            output_path
-            and os.path.exists(
-                output_path
-            )
-        ):
-
-            try:
-
-                os.remove(
-                    output_path
-                )
-
-            except Exception:
-
-                pass
-
-        with PROCESSING_LOCK:
-
-            PROCESSING_USERS.discard(
-                user_id
-            )
-
-
-# ============================================================
-# AI
-# ============================================================
-
-def ai_answer_sync(
-    question
-):
-
-    if not OPENAI_API_KEY:
-
-        raise RuntimeError(
-            "OPENAI_API_KEY မထည့်ထားပါ။"
-        )
-
-    if OpenAI is None:
-
-        raise RuntimeError(
-            "openai package မရှိပါ။"
-        )
-
-    client = OpenAI(
-        api_key=OPENAI_API_KEY
-    )
-
-    response = client.responses.create(
-
-        model=os.getenv(
-            "OPENAI_MODEL",
-            "gpt-5.6-luna"
-        ),
-
-        input=(
-
-            "You are a helpful Telegram "
-            "assistant. Answer clearly. "
-            "If the user asks in Burmese, "
-            "answer in Burmese.\n\n"
-
-            f"User question:\n{question}"
-        )
-    )
-
-    return response.output_text
-
-
-async def ask_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    if not context.args:
-
-        await update.message.reply_text(
-
-            "🤖 AI အသုံးပြုနည်း\n\n"
-
-            "/ask မေးခွန်း\n\n"
-
-            "ဥပမာ:\n"
-            "/ask နှမ်းစိုက်ပျိုးနည်းရှင်းပြပါ"
-        )
-
-        return
-
-    question = " ".join(
-        context.args
-    ).strip()
-
-    if len(question) > MAX_AI_TEXT:
-
-        question = question[
-            :MAX_AI_TEXT
-        ]
-
-    msg = await update.message.reply_text(
-        "🤖 AI စဉ်းစားနေပါတယ်..."
-    )
-
-    try:
-
-        answer = await asyncio.to_thread(
-
-            ai_answer_sync,
-
-            question
-        )
-
-        if len(answer) > 3900:
-
-            answer = answer[:3900]
-
-            answer += "\n\n..."
-
-        await msg.edit_text(
-            answer
-        )
-
-    except Exception as e:
-
-        print(
-            "AI error:",
-            repr(e)
-        )
-
-        await msg.edit_text(
-
-            "❌ AI မအလုပ်လုပ်ပါ။\n\n"
-
-            "Render Environment Variables "
-            "ထဲမှာ OPENAI_API_KEY ထည့်ထားမထား "
-            "စစ်ပါ။"
+    except Exception as error:
+
+        logger.exception(
+            "Health server error: %s",
+            error
         )
 
 
@@ -2736,12 +3316,14 @@ async def ask_command(
 
 async def error_handler(
     update,
-    context: ContextTypes.DEFAULT_TYPE
+    context
 ):
 
-    print(
-        "Telegram error:",
-        repr(context.error)
+    error = context.error
+
+    logger.error(
+        "Telegram error: %r",
+        error
     )
 
 
@@ -2751,63 +3333,67 @@ async def error_handler(
 
 def main():
 
-    print(
-        "================================"
-    )
+    if not BOT_TOKEN:
 
-    print(
+        raise RuntimeError(
+            "BOT_TOKEN မတွေ့ပါ။ "
+            "Render Environment Variables ထဲ ထည့်ပါ။"
+        )
+
+    logger.info(
         "AI PDF Helper starting..."
     )
 
-    print(
-        "================================"
-    )
-
-    if not BOT_TOKEN:
-
-        raise ValueError(
-            "BOT_TOKEN မတွေ့ပါ။"
-        )
-
-    init_db()
-
-    if OCR_API_KEY:
-
-        print(
-            "OCR API: ENABLED"
-        )
-
-    else:
-
-        print(
-            "OCR API: DISABLED"
-        )
-
-    if OPENAI_API_KEY:
-
-        print(
-            "AI API: ENABLED"
-        )
-
-    else:
-
-        print(
-            "AI API: DISABLED"
-        )
-
+    # Render health server
     threading.Thread(
-
         target=start_health_server,
-
         daemon=True
-
     ).start()
 
-    app = (
+    # --------------------------------------------------------
+    # Build Application
+    # --------------------------------------------------------
 
-        Application
-        .builder()
+    application = (
+        ApplicationBuilder()
         .token(BOT_TOKEN)
+
+        # Telegram long polling settings
+        .get_updates_read_timeout(
+            30
+        )
+        .get_updates_write_timeout(
+            30
+        )
+        .get_updates_connect_timeout(
+            30
+        )
+        .get_updates_pool_timeout(
+            5
+        )
+
+        # General Telegram request settings
+        .read_timeout(
+            30
+        )
+        .write_timeout(
+            30
+        )
+        .connect_timeout(
+            30
+        )
+        .pool_timeout(
+            5
+        )
+
+        .post_init(
+            post_init
+        )
+
+        .post_shutdown(
+            post_shutdown
+        )
+
         .build()
     )
 
@@ -2815,66 +3401,74 @@ def main():
     # Commands
     # --------------------------------------------------------
 
-    app.add_handler(
+    application.add_handler(
         CommandHandler(
             "start",
             start
         )
     )
 
-    app.add_handler(
+    application.add_handler(
         CommandHandler(
             "help",
             help_command
         )
     )
 
-    app.add_handler(
+    application.add_handler(
         CommandHandler(
             "search",
-            search_documents_command
+            search_command
         )
     )
 
-    app.add_handler(
+    application.add_handler(
         CommandHandler(
             "weather",
             weather_command
         )
     )
 
-    app.add_handler(
+    application.add_handler(
         CommandHandler(
             "rate",
             rate_command
         )
     )
 
-    app.add_handler(
+    application.add_handler(
         CommandHandler(
             "remind",
             remind_command
         )
     )
 
-    app.add_handler(
+    application.add_handler(
         CommandHandler(
             "reminders",
             reminders_command
         )
     )
 
-    app.add_handler(
+    application.add_handler(
         CommandHandler(
-            "cancelremind",
-            cancel_remind_command
+            "delremind",
+            delremind_command
         )
     )
 
-    app.add_handler(
+    application.add_handler(
         CommandHandler(
-            "ask",
-            ask_command
+            "Study",
+            study_command
+        )
+    )
+
+    # Lowercase alias
+    application.add_handler(
+        CommandHandler(
+            "study",
+            study_command
         )
     )
 
@@ -2882,7 +3476,7 @@ def main():
     # Buttons
     # --------------------------------------------------------
 
-    app.add_handler(
+    application.add_handler(
         CallbackQueryHandler(
             button_handler
         )
@@ -2892,59 +3486,45 @@ def main():
     # PDF
     # --------------------------------------------------------
 
-    app.add_handler(
-
+    application.add_handler(
         MessageHandler(
-
             filters.Document.PDF,
-
-            handle_pdf
+            document_handler
         )
     )
 
-    app.add_error_handler(
+    # --------------------------------------------------------
+    # AI text
+    # --------------------------------------------------------
+
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT
+            & ~filters.COMMAND,
+            ai_message_handler
+        )
+    )
+
+    application.add_error_handler(
         error_handler
     )
 
-    async def post_init(
-        application
-    ):
-
-        application.create_task(
-            reminder_worker(
-                application
-            )
-        )
-
-    # PTB post init
-    app.post_init = post_init
-
-    print(
+    logger.info(
         "Bot is running..."
     )
 
-    app.run_polling(
-        drop_pending_updates=True
+    # IMPORTANT:
+    # Only ONE polling process must run for this bot token.
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+        close_loop=True,
+        stop_signals=None
     )
 
 
 # ============================================================
-# SEARCH COMMAND WRAPPER
-# ============================================================
-
-async def search_documents_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    await search_command(
-        update,
-        context
-    )
-
-
-# ============================================================
-# ENTRY
+# ENTRY POINT
 # ============================================================
 
 if __name__ == "__main__":
