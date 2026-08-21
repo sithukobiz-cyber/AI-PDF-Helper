@@ -1319,30 +1319,7 @@ def main_keyboard():
                 callback_data="menu_weather"
             ),
         ],
-    if data == "menu_weather":
-
-        await query.edit_message_text(
-            "🌤 Weather\n\n"
-            "မြို့/နိုင်ငံကို ရိုက်ပို့ပါ။\n\n"
-            "ဥပမာ:\n"
-            "/weather Yangon\n"
-            "/weather Mandalay\n"
-            "/weather Tokyo\n"
-            "/weather London",
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        "🔙 Main Menu",
-                        callback_data="main_menu"
-                    )
-                ]
-            ])
-        )
-
-        return
-
-
-    if data == "menu_rate":
+     if data == "menu_rate":
 
         await query.edit_message_text(
             "💱 Exchange Rate\n\n"
