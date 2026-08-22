@@ -1564,6 +1564,10 @@ async def remind_menu(
     )
 
 
+# ============================================================
+# BUTTON HANDLER
+# ============================================================
+
 async def button_handler(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
@@ -1579,11 +1583,13 @@ async def button_handler(
     # ========================================================
 
     if data == "main_menu":
+
         await query.edit_message_text(
             "🤖 AI PDF Helper\n\n"
             "Main Menu 👇",
             reply_markup=main_keyboard()
         )
+
         return
 
     # ========================================================
@@ -1591,7 +1597,9 @@ async def button_handler(
     # ========================================================
 
     if data == "menu_pdf":
+
         await pdf_menu(query)
+
         return
 
     # ========================================================
@@ -1599,7 +1607,110 @@ async def button_handler(
     # ========================================================
 
     if data == "menu_ai":
+
         await ai_menu(query)
+
+        return
+
+    # ========================================================
+    # SEARCH MENU
+    # ========================================================
+
+    if data == "menu_search":
+
+        await query.edit_message_text(
+            "🔎 Database Search\n\n"
+            "ကိုယ့် Database ထဲက PDF/Text တွေကို "
+            "keyword နဲ့ရှာနိုင်ပါတယ်။\n\n"
+            "အသုံးပြုပုံ:\n"
+            "/search keyword\n\n"
+            "ဥပမာ:\n"
+            "/search နှမ်း\n"
+            "/search fertilizer\n"
+            "/search Myanmar\n\n"
+            "🔙 Main Menu ကိုပြန်ရန် အောက်ကခလုတ်ကိုနှိပ်ပါ။",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "🔙 Main Menu",
+                            callback_data="main_menu"
+                        )
+                    ]
+                ]
+            )
+        )
+
+        return
+
+    # ========================================================
+    # WEATHER MENU
+    # ========================================================
+
+    if data == "menu_weather":
+
+        await query.edit_message_text(
+            "🌤 Weather\n\n"
+            "ကမ္ဘာတစ်ဝှမ်းရှိ မြို့/နေရာတွေကို "
+            "Weather စစ်နိုင်ပါတယ်။\n\n"
+            "အသုံးပြုပုံ:\n"
+            "/weather Yangon\n"
+            "/weather Mandalay\n"
+            "/weather Bangkok\n"
+            "/weather Tokyo\n"
+            "/weather London\n"
+            "/weather New York\n"
+            "/weather Singapore\n\n"
+            "📍 မြို့နာမည်ကို English နဲ့ ရိုက်ပို့ပါ။",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "🔙 Main Menu",
+                            callback_data="main_menu"
+                        )
+                    ]
+                ]
+            )
+        )
+
+        return
+
+    # ========================================================
+    # EXCHANGE RATE MENU
+    # ========================================================
+
+    if data == "menu_rate":
+
+        await query.edit_message_text(
+            "💱 Exchange Rate\n\n"
+            "ငွေကြေး ၂ မျိုးကို ထည့်ပြီး "
+            "Exchange Rate စစ်နိုင်ပါတယ်။\n\n"
+            "အသုံးပြုပုံ:\n"
+            "/rate USD MMK\n"
+            "/rate USD EUR\n"
+            "/rate USD JPY\n"
+            "/rate USD CNY\n"
+            "/rate EUR GBP\n"
+            "/rate GBP USD\n"
+            "/rate SGD MMK\n"
+            "/rate THB MMK\n"
+            "/rate AUD USD\n"
+            "/rate CAD USD\n\n"
+            "ဥပမာ:\n"
+            "/rate USD MMK",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "🔙 Main Menu",
+                            callback_data="main_menu"
+                        )
+                    ]
+                ]
+            )
+        )
+
         return
 
     # ========================================================
@@ -1607,7 +1718,9 @@ async def button_handler(
     # ========================================================
 
     if data == "menu_study":
+
         await study_menu(query)
+
         return
 
     # ========================================================
@@ -1615,35 +1728,42 @@ async def button_handler(
     # ========================================================
 
     if data == "menu_remind":
+
         await remind_menu(query)
+
         return
 
     # ========================================================
     # HELP
     # ========================================================
 
-    if data == "menu_help":
+    if data == "help":
+
         await query.edit_message_text(
             "ℹ️ Help\n\n"
             "/start — Main Menu\n"
-            "/search — Database ထဲရှာရန်\n"
-            "/weather — ကမ္ဘာတစ်ဝှမ်း ရာသီဥတု\n"
-            "/rate — ငွေလဲနှုန်း\n"
-            "/remind — Reminder\n"
-            "/study — English / IT / Programming / Quiz / Daily Lesson\n\n"
+            "/search keyword — Database Search\n"
+            "/weather city — Weather\n"
+            "/rate USD MMK — Exchange Rate\n"
+            "/remind 10m စာဖတ်ရန် — Reminder\n"
+            "/reminders — Reminder List\n"
+            "/study — Study Center\n\n"
             "📄 PDF Tools\n"
             "→ PDF → Text\n\n"
             "🤖 AI Tools\n"
-            "→ AI အသုံးပြုနိုင်ပါတယ်။",
-            reply_markup=InlineKeyboardMarkup([
+            "→ AI ကို မေးနိုင်ပါတယ်။",
+            reply_markup=InlineKeyboardMarkup(
                 [
-                    InlineKeyboardButton(
-                        "🔙 Main Menu",
-                        callback_data="main_menu"
-                    )
+                    [
+                        InlineKeyboardButton(
+                            "🔙 Main Menu",
+                            callback_data="main_menu"
+                        )
+                    ]
                 ]
-            ])
+            )
         )
+
         return
 
     # ========================================================
@@ -1651,7 +1771,10 @@ async def button_handler(
     # ========================================================
 
     if data == "pdf_to_text":
-        context.user_data["waiting_for_pdf"] = True
+
+        context.user_data[
+            "waiting_for_pdf"
+        ] = True
 
         await query.edit_message_text(
             "📄 PDF → Text\n\n"
@@ -1663,6 +1786,7 @@ async def button_handler(
             "🖼️ Scanned PDF\n"
             "→ OCR အသုံးပြုမယ်။"
         )
+
         return
 
     # ========================================================
@@ -1670,49 +1794,18 @@ async def button_handler(
     # ========================================================
 
     if data.startswith("study_"):
-        subject = data.split("_", 1)[1]
+
+        subject = data.split(
+            "_",
+            1
+        )[1]
 
         await send_study_lesson(
             query,
             context,
             subject
         )
-        return
 
-    # ========================================================
-    # WEATHER BUTTON
-    # ========================================================
-
-    if data == "weather":
-        await query.edit_message_text(
-            "🌤 Weather\n\n"
-            "မြို့/နိုင်ငံကို ရိုက်ပို့ပါ။\n\n"
-            "ဥပမာ:\n"
-            "/weather Yangon\n"
-            "/weather Mandalay\n"
-            "/weather Tokyo\n"
-            "/weather London\n"
-            "/weather New York"
-        )
-        return
-
-    # ========================================================
-    # RATE BUTTON
-    # ========================================================
-
-    if data == "rate":
-        await query.edit_message_text(
-            "💱 Currency Exchange Rate\n\n"
-            "ငွေကြေး ၂ မျိုးကို ရိုက်ပို့ပါ။\n\n"
-            "ဥပမာ:\n"
-            "/rate USD MMK\n"
-            "/rate EUR USD\n"
-            "/rate GBP USD\n"
-            "/rate USD JPY\n"
-            "/rate USD CNY\n"
-            "/rate SGD MMK\n"
-            "/rate THB MMK"
-        )
         return
 
     # ========================================================
@@ -1720,14 +1813,14 @@ async def button_handler(
     # ========================================================
 
     await query.answer(
-        "ဒီခလုတ်ကို မသတ်မှတ်ရသေးပါ။",
+        "❌ ဒီခလုတ်ကို မသတ်မှတ်ရသေးပါ။",
         show_alert=True
     )
+
 
 # ============================================================
 # WEATHER
 # ============================================================
-
 GEOCODING_URL = (
     "https://geocoding-api.open-meteo.com/v1/search"
 )
